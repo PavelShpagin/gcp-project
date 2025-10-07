@@ -217,6 +217,54 @@ class Solver(object):
                                    mosaic_w, mosaic_h, output_path, compress):
         print("Using progressive stitching for memory efficiency...")
         tile_dict = {(t['row'], t['col']): t for t in tiles if t.get('image_data')}
+        
+        # ---- CRITICAL FIX: Pre-scale if compression needed and image is huge ----
+        est_mb = (mosaic_w * mosaic_h * 3) / (1024.0 * 1024.0)
+        
+        if compress and est_mb > 500:  # >500MB uncompressed (aggressive for e2-micro master)
+            print("Large mosaic detected - will build at reduced scale...")
+            # Calculate target scale to keep RAM under 800MB during stitching
+            target_mb = 800
+            scale_factor = min(0.4, (target_mb / est_mb) ** 0.5)
+            scaled_w = max(1, int(tile_w * scale_factor))
+            scaled_h = max(1, int(tile_h * scale_factor))
+            scaled_mosaic_w = num_cols * scaled_w
+            scaled_mosaic_h = num_rows * scaled_h
+            print("Building at {:.0%} scale ({} x {})".format(
+                scale_factor, scaled_mosaic_w, scaled_mosaic_h))
+            
+            # Build mosaic at reduced scale
+            mosaic = Image.new('RGB', (scaled_mosaic_w, scaled_mosaic_h), color=(0, 0, 0))
+            
+            for row in xrange(num_rows):
+                for col in xrange(num_cols):
+                    t = tile_dict.get((row, col))
+                    if not t:
+                        continue
+                    try:
+                        data = t.get('image_data')
+                        if isinstance(data, bytes):
+                            img_data = base64.b64decode(data)
+                        else:
+                            img_data = base64.b64decode(data.encode('utf-8'))
+                        img = Image.open(BytesIO(img_data))
+                        
+                        # Resize tile to scaled dimensions
+                        scaled_tile = img.resize((scaled_w, scaled_h), Image.LANCZOS)
+                        img.close()
+                        
+                        mosaic.paste(scaled_tile, (col * scaled_w, row * scaled_h))
+                        scaled_tile.close()
+                    except Exception as e:
+                        print("Error placing tile ({}, {}): {}".format(row, col, e))
+            
+            print("Saving scaled mosaic...")
+            mosaic.save(output_path, format='JPEG', quality=75, optimize=True)
+            size_mb = os.path.getsize(output_path) / (1024.0 * 1024.0)
+            print("Saved: {:.2f}MB at {:.0%} scale".format(size_mb, scale_factor))
+            return
+        
+        # ---- Standard progressive stitching for smaller mosaics ----
         base_quality = 75 if compress else 92
         target_mb = 100 if compress else None
         mosaic = Image.new('RGB', (mosaic_w, mosaic_h), color=(0, 0, 0))
@@ -328,12 +376,23 @@ class Solver(object):
                     r = requests.get(base_url, params=params, timeout=15)
                     r.raise_for_status()
                     if r.headers.get('content-type', '').startswith('image'):
+                        # ---- MEMORY OPTIMIZATION: Progressive compression ----
+                        # Load image
                         img = Image.open(BytesIO(r.content))
                         w, h = img.size
+                        
+                        # Crop watermark
                         cropped = img.crop((0, 0, w, h - crop_bottom))
+                        img.close()  # Free original immediately
+                        
+                        # Compress aggressively (JPEG quality 60 = ~100KB vs 1.5MB)
                         buf = BytesIO()
-                        cropped.save(buf, format='JPEG', quality=95)
+                        cropped.save(buf, format='JPEG', quality=60, optimize=True)
+                        cropped.close()  # Free cropped immediately
+                        
+                        # Encode compressed version (much smaller in memory)
                         image_data = base64.b64encode(buf.getvalue())
+                        buf.close()
                         break
                     else:
                         print("Non-image response for tile ({}, {})".format(row, col))
