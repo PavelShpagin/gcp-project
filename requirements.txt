@@ -1,4 +1,4 @@
-requests>=2.32.0
-Pillow>=11.0.0
-numpy>=2.3.0
-Pyro4>=4.82
+requests
+Pillow
+numpy
+Pyro4

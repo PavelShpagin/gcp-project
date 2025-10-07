@@ -1,0 +1,11 @@
+[project]
+name = "gcp-project"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pillow>=11.3.0",
+    "pyro4>=4.82",
+    "requests>=2.32.5",
+]
