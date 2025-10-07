@@ -26,22 +26,33 @@ class Solver:
         print("Job started - Google Maps parallel tile download and stitching")
         
         # Read input file
-        regions = self.read_input()
-        print(f"Processing {len(regions)} region(s)")
+        center_lat, center_lon, height_m, width_m, compress = self.read_input()
         
-        # Process each region
-        for idx, region in enumerate(regions):
-            print(f"\n=== Processing region {idx + 1}/{len(regions)} ===")
-            center_lat, center_lon, height_m, width_m, compress = region
-            print(f"Center: ({center_lat}, {center_lon})")
-            print(f"Size: {width_m}m x {height_m}m")
-            print(f"Compression: {'Enabled (max 100MB)' if compress else 'Disabled'}")
+        print(f"Center: ({center_lat}, {center_lon})")
+        print(f"Size: {width_m}m x {height_m}m")
+        print(f"Compression: {'Enabled (max 100MB)' if compress else 'Disabled'}")
+        
+        # Generate the stitched map to temporary file
+        temp_output = "temp_output.png"
+        self.process_region(center_lat, center_lon, width_m, height_m, temp_output, compress)
+        
+        # Write PNG as base64 to output file for PARCS UI download
+        if self.output_file_name:
+            print(f"\nEncoding output for PARCS UI...")
+            with open(temp_output, 'rb') as img_file:
+                img_data = img_file.read()
+                img_base64 = base64.b64encode(img_data).decode('utf-8')
             
-            # Generate the stitched map
-            output_path = f"output_{idx}.png" if len(regions) > 1 else "output.png"
-            self.process_region(center_lat, center_lon, width_m, height_m, output_path, compress)
+            with open(self.output_file_name, 'w') as out_file:
+                out_file.write("PNG_BASE64_START\n")
+                out_file.write(img_base64)
+                out_file.write("\nPNG_BASE64_END\n")
+            
+            size_mb = len(img_data) / (1024 * 1024)
+            print(f"Output written to {self.output_file_name} ({size_mb:.2f} MB)")
+            print("Download from PARCS UI and decode with: base64 -d output.txt > map.png")
         
-        print("\nAll regions processed successfully!")
+        print("\nJob completed successfully!")
 
     def process_region(self, center_lat, center_lon, width_m, height_m, output_path, compress=False):
         """Process a single region: download tiles in parallel and stitch."""
@@ -280,7 +291,7 @@ class Solver:
             size_mb = size / (1024 * 1024)
             
             if size <= max_size_bytes:
-                print(f"  Quality {quality}: {size_mb:.2f}MB ✓")
+                print(f"  Quality {quality}: {size_mb:.2f}MB [OK]")
                 with open(output_path, 'wb') as f:
                     f.write(buffer.getvalue())
                 return
@@ -299,24 +310,17 @@ class Solver:
     
 
     def read_input(self):
-        """Read input file and parse region specifications."""
+        """Read input file and parse region specification (single region only)."""
         with open(self.input_file_name, 'r') as f:
             lines = [line.strip() for line in f if line.strip()]
         
-        num_regions = int(lines[0])
-        regions = []
+        center_lat = float(lines[0])
+        center_lon = float(lines[1])
+        height_m = float(lines[2])
+        width_m = float(lines[3])
+        compress = int(lines[4]) == 1  # 1 = compress, 0 = don't compress
         
-        idx = 1
-        for _ in range(num_regions):
-            center_lat = float(lines[idx])
-            center_lon = float(lines[idx + 1])
-            height_m = float(lines[idx + 2])
-            width_m = float(lines[idx + 3])
-            compress = int(lines[idx + 4]) == 1  # 1 = compress, 0 = don't compress
-            regions.append((center_lat, center_lon, height_m, width_m, compress))
-            idx += 5
-        
-        return regions
+        return center_lat, center_lon, height_m, width_m, compress
 
     @staticmethod
     @expose
