@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
 """
 Decode base64-encoded PNG from PARCS output file
+Compatible with Python 2.7 and Python 3.x
 Usage: python decode_output.py output.txt map.png
 """
+from __future__ import print_function
 import sys
 import base64
 
@@ -22,14 +25,19 @@ def decode_png(input_file, output_file):
     
     base64_data = content[start_idx + len(start_marker):end_idx]
     
-    # Decode and save
-    png_data = base64.b64decode(base64_data)
+    # Decode (Python 2/3 compatible)
+    try:
+        png_data = base64.b64decode(base64_data)
+    except Exception as e:
+        print("ERROR: Failed to decode base64 data: {}".format(e))
+        sys.exit(1)
     
+    # Save
     with open(output_file, 'wb') as f:
         f.write(png_data)
     
-    size_mb = len(png_data) / (1024 * 1024)
-    print(f"Successfully decoded {size_mb:.2f} MB PNG to {output_file}")
+    size_mb = len(png_data) / (1024.0 * 1024.0)
+    print("Successfully decoded {:.2f} MB PNG to {}".format(size_mb, output_file))
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
@@ -37,4 +45,3 @@ if __name__ == "__main__":
         sys.exit(1)
     
     decode_png(sys.argv[1], sys.argv[2])
-

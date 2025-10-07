@@ -54,15 +54,24 @@ class Solver(object):
             temp_output = "temp_output.png"
             self.process_region(center_lat, center_lon, width_m, height_m, temp_output, compress)
 
-            # ---- Write result ----
+            # ---- Write result (base64-encoded for PARCS UI) ----
             if self.output_file_name:
-                with open(temp_output, "rb") as src, open(self.output_file_name, "wb") as dst:
-                    dst.write(src.read())
-                try:
-                    size_mb = os.path.getsize(self.output_file_name) / (1024.0 * 1024.0)
-                    print("Output written to {} ({:.2f} MB)".format(self.output_file_name, size_mb))
-                except Exception:
-                    pass
+                print("Encoding output for PARCS UI...")
+                with open(temp_output, "rb") as img_file:
+                    img_data = img_file.read()
+                    # Python 2/3 compatible base64 encoding
+                    img_base64 = base64.b64encode(img_data)
+                    if not isinstance(img_base64, str):
+                        img_base64 = img_base64.decode('utf-8')
+                
+                with open(self.output_file_name, "w") as out_file:
+                    out_file.write("PNG_BASE64_START\n")
+                    out_file.write(img_base64)
+                    out_file.write("\nPNG_BASE64_END\n")
+                
+                size_mb = len(img_data) / (1024.0 * 1024.0)
+                print("Output written to {} ({:.2f} MB)".format(self.output_file_name, size_mb))
+                print("Download from PARCS UI and decode with: python decode_output.py output.txt map.png")
 
             print("Job completed successfully!")
 
