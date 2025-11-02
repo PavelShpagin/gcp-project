@@ -1,424 +1,569 @@
+# -*- coding: utf-8 -*-
+from __future__ import print_function, division
+
 """
 PARCS Solution for Parallel Google Maps Tile Downloading and Stitching
+Compatible with both Python 2.7 and Python 3.x
 """
 
 from Pyro4 import expose
 import os
-import sys
 import base64
 import math
 import time
+import traceback
 import requests
 import numpy as np
 from PIL import Image
-from io import BytesIO
+
+# ---- Python 2/3 compatibility shims ----
+try:
+    xrange
+except NameError:
+    xrange = range
+
+try:
+    from io import BytesIO
+except ImportError:
+    from StringIO import StringIO as BytesIO
 
 
-class Solver:
+class Solver(object):
     def __init__(self, workers=None, input_file_name=None, output_file_name=None):
         self.input_file_name = input_file_name
         self.output_file_name = output_file_name
-        self.workers = workers
+        self.workers = workers or []
         print("Solver initialized")
-        print(f"Workers: {len(workers) if workers else 0}")
+        print("Workers: {}".format(len(self.workers)))
 
+    # -------------------------------------------------
+    # Main entrypoint
+    # -------------------------------------------------
     def solve(self):
-        print("Job started - Google Maps parallel tile download and stitching")
-        
-        # Read input file
-        center_lat, center_lon, height_m, width_m, compress = self.read_input()
-        
-        print(f"Center: ({center_lat}, {center_lon})")
-        print(f"Size: {width_m}m x {height_m}m")
-        print(f"Compression: {'Enabled (max 100MB)' if compress else 'Disabled'}")
-        
-        # Generate the stitched map to temporary file
-        temp_output = "temp_output.png"
-        self.process_region(center_lat, center_lon, width_m, height_m, temp_output, compress)
-        
-        # Write PNG as base64 to output file for PARCS UI download
-        if self.output_file_name:
-            print(f"\nEncoding output for PARCS UI...")
-            with open(temp_output, 'rb') as img_file:
-                img_data = img_file.read()
-                img_base64 = base64.b64encode(img_data).decode('utf-8')
-            
-            with open(self.output_file_name, 'w') as out_file:
-                out_file.write("PNG_BASE64_START\n")
-                out_file.write(img_base64)
-                out_file.write("\nPNG_BASE64_END\n")
-            
-            size_mb = len(img_data) / (1024 * 1024)
-            print(f"Output written to {self.output_file_name} ({size_mb:.2f} MB)")
-            print("Download from PARCS UI and decode with: base64 -d output.txt > map.png")
-        
-        print("\nJob completed successfully!")
+        try:
+            print("Job started - Google Maps parallel tile download and stitching")
 
+            # ---- Read input (single region) ----
+            center_lat, center_lon, height_m, width_m, compress = self.read_input()
+            print("Center: ({}, {})".format(center_lat, center_lon))
+            print("Size: {}m x {}m".format(width_m, height_m))
+            print("Compression: {}".format("Enabled (max 100MB)" if compress else "Disabled"))
+
+            # ---- Process and build mosaic ----
+            temp_output = "temp_output.png"
+            self.process_region(center_lat, center_lon, width_m, height_m, temp_output, compress)
+
+            # ---- Write result (base64-encoded for PARCS UI) ----
+            if self.output_file_name:
+                print("Encoding output for PARCS UI...")
+                with open(temp_output, "rb") as img_file:
+                    img_data = img_file.read()
+                    # Python 2/3 compatible base64 encoding
+                    img_base64 = base64.b64encode(img_data)
+                    if not isinstance(img_base64, str):
+                        img_base64 = img_base64.decode('utf-8')
+                
+                with open(self.output_file_name, "w") as out_file:
+                    out_file.write("PNG_BASE64_START\n")
+                    out_file.write(img_base64)
+                    out_file.write("\nPNG_BASE64_END\n")
+                
+                size_mb = len(img_data) / (1024.0 * 1024.0)
+                print("Output written to {} ({:.2f} MB)".format(self.output_file_name, size_mb))
+                print("Download from PARCS UI and decode with: python decode_output.py output.txt map.png")
+
+            print("Job completed successfully!")
+
+        except Exception:
+            tb = traceback.format_exc()
+            print(tb)
+            out = self.output_file_name or "error.txt"
+            try:
+                with open(out, "w") as f:
+                    f.write(tb)
+            except Exception:
+                pass
+            raise
+
+    # -------------------------------------------------
+    # Region processing
+    # -------------------------------------------------
     def process_region(self, center_lat, center_lon, width_m, height_m, output_path, compress=False):
-        """Process a single region: download tiles in parallel and stitch."""
-        
-        # Configuration
+        """Download tiles (via workers) and stitch to a mosaic."""
         zoom = 19
         tile_size_px = 640
         scale = 2
-        resolution_m = 100  # Each tile covers approximately this many meters
-        crop_bottom = 40  # Pixels to crop from bottom (remove watermark)
-        
-        # Calculate grid dimensions
+        resolution_m = 100
+        crop_bottom = 40
+
+        # ---- Grid ----
         num_cols = max(1, int(width_m / resolution_m))
         num_rows = max(1, int(height_m / resolution_m))
         total_tiles = num_cols * num_rows
-        
-        print(f"Grid: {num_rows}x{num_cols} = {total_tiles} tiles")
-        
-        # Calculate tile coordinates using Web Mercator projection
-        tile_requests = self.calculate_tile_coordinates(
-            center_lat, center_lon, num_rows, num_cols, 
-            zoom, tile_size_px
-        )
-        
-        # Distribute tile download tasks to workers (with sequential fallback)
-        num_workers = len(self.workers) if self.workers else 0
-        print(f"Distributing {len(tile_requests)} tiles across {num_workers} workers")
+        print("Grid: {}x{} = {} tiles".format(num_rows, num_cols, total_tiles))
 
+        # ---- Tile centers ----
+        tile_requests = self.calculate_tile_coordinates(
+            center_lat, center_lon, num_rows, num_cols, zoom, tile_size_px
+        )
+
+        # ---- Dispatch ----
+        num_workers = len(self.workers)
+        print("Distributing {} tiles across {} workers".format(len(tile_requests), num_workers))
         downloaded_tiles = []
 
         if num_workers == 0:
             print("No workers available; downloading tiles sequentially...")
             downloaded_tiles = Solver.download_tiles(tile_requests, zoom, tile_size_px, scale, crop_bottom)
         else:
-            # Split tiles among workers
-            tiles_per_worker = max(1, len(tile_requests) // num_workers)
-            worker_tasks = []
-
-            for i, worker in enumerate(self.workers):
-                start_idx = i * tiles_per_worker
-                end_idx = start_idx + tiles_per_worker if i < num_workers - 1 else len(tile_requests)
-
-                if start_idx < len(tile_requests):
-                    worker_batch = tile_requests[start_idx:end_idx]
-                    print(f"Worker {i}: downloading {len(worker_batch)} tiles")
-
-                    # Submit task to worker
-                    future = worker.download_tiles(worker_batch, zoom, tile_size_px, scale, crop_bottom)
-                    worker_tasks.append(future)
-
-            # Collect results from workers
-            print("Waiting for workers to download tiles...")
-            for i, future in enumerate(worker_tasks):
-                tiles = future.value
-                print(f"Worker {i} completed: {len(tiles)} tiles downloaded")
+            # CRITICAL MEMORY OPTIMIZATION: Incremental processing to prevent OOM
+            # For 900 tiles (3000x3000), we must process batches incrementally
+            total_tiles = len(tile_requests)
+            
+            # Ultra-aggressive batch sizing for large jobs
+            if total_tiles > 500:
+                # Very large jobs: minimal batches to prevent crashes
+                max_batch_size = 5  # Minimal batches for 900+ tile jobs (was 8)
+                max_concurrent_batches = max(1, num_workers // 2)  # Half workers to reduce pressure
+            elif total_tiles > 200:
+                # Medium jobs: small batches
+                max_batch_size = 8
+                max_concurrent_batches = num_workers
+            else:
+                # Small jobs: can use larger batches
+                max_batch_size = 12
+                max_concurrent_batches = num_workers * 2
+            
+            chunk_size = max_batch_size
+            total_batches = (total_tiles + chunk_size - 1) // chunk_size
+            
+            print("Memory-optimized batching: {} tiles in batches of {} ({} batches, max {} concurrent)".format(
+                total_tiles, chunk_size, total_batches, max_concurrent_batches))
+            
+            # Process batches incrementally - don't accumulate all futures
+            worker_idx = 0
+            active_batches = []  # List of (worker_idx, fut) tuples
+            completed_count = 0
+            
+            for batch_start in xrange(0, len(tile_requests), chunk_size):
+                batch_end = min(batch_start + chunk_size, len(tile_requests))
+                batch = tile_requests[batch_start:batch_end]
+                
+                # If we have too many batches in flight, wait for one to complete
+                while len(active_batches) >= max_concurrent_batches:
+                    # Wait for the first batch to complete
+                    worker_idx_done, fut_done = active_batches.pop(0)
+                    tiles = fut_done.value
+                    print("Worker {} completed: {} tiles downloaded (batch {}/{})".format(
+                        worker_idx_done, len(tiles), completed_count + 1, total_batches))
+                    downloaded_tiles.extend(tiles)
+                    completed_count += 1
+                    
+                    # CRITICAL: Explicitly free batch results to prevent accumulation
+                    del tiles
+                    del fut_done
+                    
+                    # Force garbage collection after each batch
+                    try:
+                        import gc
+                        gc.collect()
+                    except Exception:
+                        pass
+                    
+                    # Small delay to let memory settle before next batch
+                    if total_tiles > 500:
+                        time.sleep(0.15)  # Slightly longer delay for very large jobs
+                
+                # Submit new batch
+                worker = self.workers[worker_idx]
+                print("Worker {}: downloading {} tiles (batch {}/{})".format(
+                    worker_idx, len(batch), completed_count + len(active_batches) + 1, total_batches))
+                fut = worker.download_tiles(batch, zoom, tile_size_px, scale, crop_bottom)
+                active_batches.append((worker_idx, fut))
+                
+                # Round-robin through workers
+                worker_idx = (worker_idx + 1) % num_workers
+            
+            # Wait for remaining batches
+            print("Waiting for remaining {} batches...".format(len(active_batches)))
+            for worker_idx, fut in active_batches:
+                tiles = fut.value
+                print("Worker {} completed: {} tiles downloaded (batch {}/{})".format(
+                    worker_idx, len(tiles), completed_count + 1, total_batches))
                 downloaded_tiles.extend(tiles)
+                completed_count += 1
+                
+                # CRITICAL: Explicitly free batch results to prevent accumulation
+                del tiles
+                del fut
+                
+                # Force garbage collection after each batch
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
+                
+                # Small delay to let memory settle
+                if total_tiles > 500:
+                    time.sleep(0.1)
 
-        print(f"Total tiles downloaded: {len(downloaded_tiles)}")
-        
-        # Stitch tiles into mosaic
+        print("Total tiles downloaded: {}".format(len(downloaded_tiles)))
+
+        # ---- Stitch ----
         print("Stitching tiles into mosaic...")
-        self.create_mosaic(downloaded_tiles, num_rows, num_cols, tile_size_px, scale, crop_bottom, output_path, compress)
-        print(f"Mosaic saved to {output_path}")
+        self.create_mosaic(downloaded_tiles, num_rows, num_cols, tile_size_px, scale,
+                           crop_bottom, output_path, compress)
+        print("Mosaic saved to {}".format(output_path))
 
+    # -------------------------------------------------
+    # Tile coordinate generation
+    # -------------------------------------------------
     def calculate_tile_coordinates(self, center_lat, center_lon, num_rows, num_cols, zoom, tile_size_px):
-        """Calculate coordinates for all tiles using Web Mercator projection."""
-        
+        """Compute tile center coordinates."""
         world_px = 256 * (2 ** zoom)
-        
+
         def latlon_to_pixel(lat, lon):
             x = (lon + 180.0) / 360.0 * world_px
             siny = math.sin(math.radians(lat))
             y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * world_px
             return x, y
-        
+
         def pixel_to_latlon(x, y):
-            lon = x / world_px * 360.0 - 180.0
-            n = math.pi - 2.0 * math.pi * y / world_px
+            lon = x / float(world_px) * 360.0 - 180.0
+            n = math.pi - 2.0 * math.pi * y / float(world_px)
             lat = math.degrees(math.atan(math.sinh(n)))
             return lat, lon
-        
+
         cx, cy = latlon_to_pixel(center_lat, center_lon)
         step_px = tile_size_px
-        
-        tile_requests = []
-        for i in range(num_rows):
-            for j in range(num_cols):
-                dx_px = (j - (num_cols - 1) / 2.0) * step_px
-                dy_px = (i - (num_rows - 1) / 2.0) * step_px
-                x = cx + dx_px
-                y = cy + dy_px
+        tiles = []
+        for i in xrange(num_rows):
+            for j in xrange(num_cols):
+                dx = (j - (num_cols - 1) / 2.0) * step_px
+                dy = (i - (num_rows - 1) / 2.0) * step_px
+                x = cx + dx
+                y = cy + dy
                 lat, lon = pixel_to_latlon(x, y)
-                
-                tile_requests.append({
-                    'lat': lat,
-                    'lon': lon,
-                    'row': i,
-                    'col': j
-                })
-        
-        return tile_requests
+                tiles.append({'lat': lat, 'lon': lon, 'row': i, 'col': j})
+        return tiles
 
-    def create_mosaic(self, tiles, num_rows, num_cols, tile_size_px, scale, crop_bottom, output_path, compress=False):
-        """Create mosaic from downloaded tiles with memory-efficient processing."""
-        
-        # Calculate actual tile dimensions after cropping
-        original_tile_size = tile_size_px * scale
-        cropped_tile_height = original_tile_size - crop_bottom
-        cropped_tile_width = original_tile_size  # Width unchanged
-        
-        mosaic_width = num_cols * cropped_tile_width
-        mosaic_height = num_rows * cropped_tile_height
-        
-        print(f"Creating mosaic: {mosaic_width}x{mosaic_height} pixels (each tile: {cropped_tile_width}x{cropped_tile_height})")
-        
-        # Sort tiles by row and col for proper placement
+    # -------------------------------------------------
+    # Mosaic creation
+    # -------------------------------------------------
+    def create_mosaic(self, tiles, num_rows, num_cols, tile_size_px, scale, crop_bottom,
+                      output_path, compress=False):
+        """Combine tiles into a single mosaic image."""
+        original_tile = tile_size_px * scale
+        cropped_h = original_tile - crop_bottom
+        cropped_w = original_tile
+        mosaic_w = num_cols * cropped_w
+        mosaic_h = num_rows * cropped_h
+        print("Creating mosaic: {}x{} px (tile {}x{})".format(mosaic_w, mosaic_h, cropped_w, cropped_h))
+
         tiles.sort(key=lambda t: (t['row'], t['col']))
-        
-        # Determine if we need aggressive compression for large images
-        estimated_size_mb = (mosaic_width * mosaic_height * 3) / (1024 * 1024)
-        print(f"Estimated uncompressed size: {estimated_size_mb:.1f}MB")
-        
-        if compress or estimated_size_mb > 500:
-            # Use progressive row-by-row stitching for large images
-            self._create_mosaic_progressive(tiles, num_rows, num_cols, cropped_tile_width, 
-                                           cropped_tile_height, mosaic_width, mosaic_height, 
-                                           output_path, compress)
-        else:
-            # Standard in-memory stitching for smaller images
-            mosaic = Image.new('RGB', (mosaic_width, mosaic_height), color=(0, 0, 0))
-            
-            for tile in tiles:
-                if tile['image_data']:
-                    try:
-                        img_data = base64.b64decode(tile['image_data'])
-                        img = Image.open(BytesIO(img_data))
-                        x_px = tile['col'] * cropped_tile_width
-                        y_px = tile['row'] * cropped_tile_height
-                        mosaic.paste(img, (x_px, y_px))
-                    except Exception as e:
-                        print(f"Error placing tile ({tile['row']}, {tile['col']}): {e}")
-            
-            mosaic.save(output_path, quality=95, optimize=True)
-    
-    def _create_mosaic_progressive(self, tiles, num_rows, num_cols, tile_width, tile_height, 
-                                   mosaic_width, mosaic_height, output_path, compress):
-        """Memory-efficient progressive mosaic creation with dynamic compression."""
-        
+        est_mb = (mosaic_w * mosaic_h * 3) / (1024.0 * 1024.0)
+        print("Estimated uncompressed size: {:.1f}MB".format(est_mb))
+
+        if not compress and est_mb <= 500:
+            mosaic = Image.new('RGB', (mosaic_w, mosaic_h), color=(0, 0, 0))
+            for t in tiles:
+                data = t.get('image_data')
+                if not data:
+                    continue
+                try:
+                    if isinstance(data, bytes):
+                        img_data = base64.b64decode(data)
+                    else:
+                        img_data = base64.b64decode(data.encode('utf-8'))
+                    img = Image.open(BytesIO(img_data))
+                    mosaic.paste(img, (t['col'] * cropped_w, t['row'] * cropped_h))
+                except Exception as e:
+                    print("Error placing tile ({}, {}): {}".format(t['row'], t['col'], e))
+            mosaic.save(output_path, format='PNG')
+            return
+
+        self._create_mosaic_progressive(tiles, num_rows, num_cols, cropped_w, cropped_h,
+                                        mosaic_w, mosaic_h, output_path, compress)
+
+    # -------------------------------------------------
+    def _create_mosaic_progressive(self, tiles, num_rows, num_cols, tile_w, tile_h,
+                                   mosaic_w, mosaic_h, output_path, compress):
         print("Using progressive stitching for memory efficiency...")
+        tile_dict = {(t['row'], t['col']): t for t in tiles if t.get('image_data')}
         
-        # Create tiles dictionary for fast lookup
-        tile_dict = {(t['row'], t['col']): t for t in tiles if t['image_data']}
+        # ---- CRITICAL FIX: Pre-scale if compression needed and image is huge ----
+        est_mb = (mosaic_w * mosaic_h * 3) / (1024.0 * 1024.0)
         
-        # Process in row chunks to reduce memory
-        chunk_rows = max(1, min(10, num_rows))  # Process 10 rows at a time
-        
-        # Determine target quality based on compression flag
-        if compress:
-            # Start with medium quality for compression
-            base_quality = 75
-            target_size_mb = 100
-        else:
-            # High quality for no compression
-            base_quality = 92
-            target_size_mb = None
-        
-        mosaic = Image.new('RGB', (mosaic_width, mosaic_height), color=(0, 0, 0))
-        
-        # Stitch tiles row by row
-        for chunk_start in range(0, num_rows, chunk_rows):
-            chunk_end = min(chunk_start + chunk_rows, num_rows)
-            print(f"  Processing rows {chunk_start}-{chunk_end}/{num_rows}...")
+        if compress and est_mb > 500:  # >500MB uncompressed (aggressive for e2-micro master)
+            print("Large mosaic detected - will build at reduced scale...")
+            # Calculate target scale to keep RAM under 800MB during stitching
+            target_mb = 800
+            scale_factor = min(0.4, (target_mb / est_mb) ** 0.5)
+            scaled_w = max(1, int(tile_w * scale_factor))
+            scaled_h = max(1, int(tile_h * scale_factor))
+            scaled_mosaic_w = num_cols * scaled_w
+            scaled_mosaic_h = num_rows * scaled_h
+            print("Building at {:.0%} scale ({} x {})".format(
+                scale_factor, scaled_mosaic_w, scaled_mosaic_h))
             
-            for row in range(chunk_start, chunk_end):
-                for col in range(num_cols):
-                    tile = tile_dict.get((row, col))
-                    if tile:
-                        try:
-                            img_data = base64.b64decode(tile['image_data'])
-                            img = Image.open(BytesIO(img_data))
-                            x_px = col * tile_width
-                            y_px = row * tile_height
-                            mosaic.paste(img, (x_px, y_px))
-                            img.close()  # Free memory immediately
-                        except Exception as e:
-                            print(f"    Error placing tile ({row}, {col}): {e}")
-        
-        # Save with appropriate compression
-        print("Saving mosaic...")
-        if compress and target_size_mb:
-            self._save_with_smart_compression(mosaic, output_path, target_size_mb, base_quality)
-        else:
-            mosaic.save(output_path, format='JPEG', quality=base_quality, optimize=True)
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"  Saved: {size_mb:.2f}MB")
-    
-    def _save_with_smart_compression(self, image, output_path, target_mb, start_quality):
-        """Fast smart compression with aggressive downscaling for huge images."""
-        max_size_bytes = target_mb * 1024 * 1024
-        
-        print(f"Applying smart compression (target: {target_mb}MB)...")
-        
-        # For very large images, estimate if we need to downscale first
-        width, height = image.size
-        estimated_full_size = (width * height * 3) / (1024 * 1024)  # Rough RGB estimate
-        
-        print(f"  Original size: {width}x{height} (estimated {estimated_full_size:.0f}MB uncompressed)")
-        
-        # If estimated size is way over target, jump straight to aggressive downscaling
-        if estimated_full_size > target_mb * 20:  # More than 20x target size
-            print(f"  Very large image detected - applying aggressive downscaling first...")
+            # Build mosaic at reduced scale
+            mosaic = Image.new('RGB', (scaled_mosaic_w, scaled_mosaic_h), color=(0, 0, 0))
             
-            # Calculate target scale - be very aggressive
-            target_pixels = target_mb * 500000  # Conservative heuristic
-            current_pixels = width * height
-            scale_factor = min(0.45, (target_pixels / current_pixels) ** 0.5)
+            for row in xrange(num_rows):
+                for col in xrange(num_cols):
+                    t = tile_dict.get((row, col))
+                    if not t:
+                        continue
+                    try:
+                        data = t.get('image_data')
+                        if isinstance(data, bytes):
+                            img_data = base64.b64decode(data)
+                        else:
+                            img_data = base64.b64decode(data.encode('utf-8'))
+                        img = Image.open(BytesIO(img_data))
+                        
+                        # Resize tile to scaled dimensions
+                        scaled_tile = img.resize((scaled_w, scaled_h), Image.LANCZOS)
+                        img.close()
+                        
+                        mosaic.paste(scaled_tile, (col * scaled_w, row * scaled_h))
+                        scaled_tile.close()
+                    except Exception as e:
+                        print("Error placing tile ({}, {}): {}".format(row, col, e))
             
-            new_w = int(width * scale_factor)
-            new_h = int(height * scale_factor)
-            
-            print(f"  Downscaling to {scale_factor:.1%} ({new_w}x{new_h})...")
-            resized = image.resize((new_w, new_h), Image.LANCZOS)
-            
-            # Save directly with good quality - should be under target now
-            resized.save(output_path, format='JPEG', quality=80, optimize=True)
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"  Final: {size_mb:.2f}MB at {scale_factor:.0%} scale, quality 80 ✓")
-            resized.close()
+            print("Saving scaled mosaic...")
+            mosaic.save(output_path, format='JPEG', quality=75, optimize=True)
+            size_mb = os.path.getsize(output_path) / (1024.0 * 1024.0)
+            print("Saved: {:.2f}MB at {:.0%} scale".format(size_mb, scale_factor))
             return
         
-        # Standard compression for smaller images
-        for quality in [start_quality, 60, 45]:
-            buffer = BytesIO()
-            image.save(buffer, format='JPEG', quality=quality, optimize=True)
-            size = buffer.tell()
-            size_mb = size / (1024 * 1024)
-            
-            if size <= max_size_bytes:
-                print(f"  Quality {quality}: {size_mb:.2f}MB [OK]")
-                with open(output_path, 'wb') as f:
-                    f.write(buffer.getvalue())
+        # ---- Standard progressive stitching for smaller mosaics ----
+        base_quality = 75 if compress else 92
+        target_mb = 100 if compress else None
+        mosaic = Image.new('RGB', (mosaic_w, mosaic_h), color=(0, 0, 0))
+
+        for row in xrange(num_rows):
+            for col in xrange(num_cols):
+                t = tile_dict.get((row, col))
+                if not t:
+                    continue
+                try:
+                    data = t.get('image_data')
+                    if isinstance(data, bytes):
+                        img_data = base64.b64decode(data)
+                    else:
+                        img_data = base64.b64decode(data.encode('utf-8'))
+                    img = Image.open(BytesIO(img_data))
+                    mosaic.paste(img, (col * tile_w, row * tile_h))
+                    img.close()
+                except Exception as e:
+                    print("Error placing tile ({}, {}): {}".format(row, col, e))
+
+        print("Saving mosaic...")
+        if compress and target_mb:
+            self._save_with_smart_compression(mosaic, output_path, target_mb, base_quality)
+        else:
+            mosaic.save(output_path, format='JPEG', quality=base_quality, optimize=True)
+            try:
+                size_mb = os.path.getsize(output_path) / (1024.0 * 1024.0)
+                print("Saved: {:.2f}MB".format(size_mb))
+            except Exception:
+                pass
+
+    # -------------------------------------------------
+    def _save_with_smart_compression(self, image, output_path, target_mb, start_quality):
+        max_bytes = target_mb * 1024 * 1024
+        w, h = image.size
+        est_full = (w * h * 3) / (1024.0 * 1024.0)
+        print("Original size: {}x{} (~{:.0f}MB RGB)".format(w, h, est_full))
+
+        if est_full > target_mb * 20:
+            print("Very large image - aggressive downscaling first...")
+            target_pixels = target_mb * 500000.0
+            current_pixels = float(w) * float(h)
+            scale = min(0.45, (target_pixels / current_pixels) ** 0.5)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            print("Downscaling to {:.0%} ({}x{})".format(scale, new_w, new_h))
+            resized = image.resize((new_w, new_h), Image.LANCZOS)
+            resized.save(output_path, format='JPEG', quality=80, optimize=True)
+            return
+
+        for q in (start_quality, 60, 45):
+            buf = BytesIO()
+            image.save(buf, format='JPEG', quality=q, optimize=True)
+            size = buf.tell()
+            if size <= max_bytes:
+                with open(output_path, "wb") as f:
+                    f.write(buf.getvalue())
+                print("Quality {} OK ({:.2f}MB)".format(q, size / (1024.0 * 1024.0)))
                 return
             else:
-                print(f"  Quality {quality}: {size_mb:.2f}MB (too large)")
-        
-        # Moderate downscaling
-        scale = 0.7
-        new_w = int(width * scale)
-        new_h = int(height * scale)
-        resized = image.resize((new_w, new_h), Image.LANCZOS)
+                print("Quality {} too large ({:.2f}MB)".format(q, size / (1024.0 * 1024.0)))
+
+        resized = image.resize((int(w * 0.7), int(h * 0.7)), Image.LANCZOS)
         resized.save(output_path, format='JPEG', quality=75, optimize=True)
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"  Final: {size_mb:.2f}MB at {scale:.0%} scale")
-        resized.close()
-    
+        print("Final: downscaled to 70% and saved")
 
+    # -------------------------------------------------
     def read_input(self):
-        """Read input file and parse region specification (single region only)."""
-        with open(self.input_file_name, 'r') as f:
+        with open(self.input_file_name, "r") as f:
             lines = [line.strip() for line in f if line.strip()]
-        
-        center_lat = float(lines[0])
-        center_lon = float(lines[1])
-        height_m = float(lines[2])
-        width_m = float(lines[3])
-        compress = int(lines[4]) == 1  # 1 = compress, 0 = don't compress
-        
-        return center_lat, center_lon, height_m, width_m, compress
+        lat = float(lines[0])
+        lon = float(lines[1])
+        h = float(lines[2])
+        w = float(lines[3])
+        compress = int(lines[4]) == 1
+        return lat, lon, h, w, compress
 
+    # -------------------------------------------------
     @staticmethod
     @expose
     def download_tiles(tile_requests, zoom, tile_size_px, scale, crop_bottom=40):
-        """
-        Worker method: Download a batch of tiles from Google Maps.
-        Returns list of tiles with base64-encoded image data (cropped to remove watermark).
-        """
-        print(f"Worker downloading {len(tile_requests)} tiles...")
-        
-        # Get API key from environment
+        print("Worker downloading {} tiles...".format(len(tile_requests)))
         api_key = os.environ.get('GMAPS_KEY') or os.environ.get('GOOGLE_MAPS_API_KEY')
         if not api_key:
             print("ERROR: No Google Maps API key found in environment!")
             return []
-        
+
         base_url = "https://maps.googleapis.com/maps/api/staticmap"
         results = []
+
+        # OPTIMIZATION: Use HTTP session for connection pooling (reduces overhead)
+        try:
+            session = requests.Session()
+            session.headers.update({'Connection': 'keep-alive'})
+        except Exception:
+            session = None
+
+        # OPTIMIZATION: Reduce throttle delay for better throughput
+        # Lower from 0.1s to 0.05s - still safe for rate limits
+        throttle_delay = 0.05
         
+        # CRITICAL: Adaptive compression quality based on batch size
+        # Large batches (5+ tiles) need more aggressive compression to prevent OOM
+        batch_size = len(tile_requests)
+        if batch_size >= 5:
+            jpeg_quality = 40  # Ultra-aggressive for large batches (~40KB per tile)
+        elif batch_size >= 3:
+            jpeg_quality = 45  # Moderate compression (~50KB per tile)
+        else:
+            jpeg_quality = 50  # Standard compression for small batches (~60KB per tile)
+
         for idx, req in enumerate(tile_requests):
-            lat = req['lat']
-            lon = req['lon']
-            row = req['row']
-            col = req['col']
-            
-            # Build request URL
+            lat = req['lat']; lon = req['lon']
+            row = req['row']; col = req['col']
             params = {
-                'center': f'{lat:.10f},{lon:.10f}',
+                'center': '{:.10f},{:.10f}'.format(lat, lon),
                 'zoom': zoom,
-                'size': f'{tile_size_px}x{tile_size_px}',
+                'size': '{}x{}'.format(tile_size_px, tile_size_px),
                 'scale': scale,
                 'maptype': 'satellite',
                 'format': 'jpg',
                 'key': api_key
             }
-            
-            # Make request with retries
-            max_retries = 3
-            backoff = 1.0
+
             image_data = None
-            
-            for attempt in range(max_retries):
+            for attempt in range(3):
                 try:
-                    # Rate limiting
-                    time.sleep(0.1)
+                    time.sleep(throttle_delay)
                     
-                    response = requests.get(base_url, params=params, timeout=15)
-                    response.raise_for_status()
-                    
-                    if response.headers.get('content-type', '').startswith('image'):
-                        # Crop Google watermark from bottom of image
-                        img = Image.open(BytesIO(response.content))
-                        width, height = img.size
+                    # Use session if available for connection reuse
+                    # Reduced timeout for large batches to fail faster and free memory
+                    http_timeout = 10 if batch_size >= 5 else 15
+                    if session is not None:
+                        r = session.get(base_url, params=params, timeout=http_timeout)
+                    else:
+                        r = requests.get(base_url, params=params, timeout=http_timeout)
+                    r.raise_for_status()
+                    if r.headers.get('content-type', '').startswith('image'):
+                        # ---- MEMORY OPTIMIZATION: Aggressive compression and immediate cleanup ----
+                        # Load image from response content
+                        response_content = r.content
+                        r.close()  # Close response immediately to free connection
+                        del r  # Explicit cleanup
                         
-                        # Crop specified pixels from bottom (where watermark is)
-                        cropped_img = img.crop((0, 0, width, height - crop_bottom))
+                        img = Image.open(BytesIO(response_content))
+                        w, h = img.size
                         
-                        # Encode cropped image as base64 for transfer
-                        buffer = BytesIO()
-                        cropped_img.save(buffer, format='JPEG', quality=95)
-                        image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                        # Crop watermark immediately
+                        cropped = img.crop((0, 0, w, h - crop_bottom))
+                        img.close()  # Free original immediately
+                        del img  # Explicit cleanup
+                        del response_content  # Free response content immediately
+                        
+                        # CRITICAL: For very large batches, resize before compression to save memory
+                        # This reduces memory footprint significantly without affecting final quality much
+                        if batch_size >= 5:
+                            # Resize to 90% before compression - saves ~19% memory with minimal quality loss
+                            cw, ch = cropped.size
+                            resized = cropped.resize((int(cw * 0.9), int(ch * 0.9)), Image.LANCZOS)
+                            cropped.close()
+                            del cropped
+                            cropped = resized
+                        
+                        # CRITICAL: Adaptive compression based on batch size to reduce memory
+                        # Quality 40 for large batches: ~40KB vs ~60KB vs ~100KB (quality 50 vs 60)
+                        buf = BytesIO()
+                        cropped.save(buf, format='JPEG', quality=jpeg_quality, optimize=True)
+                        cropped.close()  # Free cropped immediately
+                        del cropped  # Explicit cleanup
+                        
+                        # Encode compressed version (much smaller in memory)
+                        buf_value = buf.getvalue()
+                        buf.close()
+                        del buf  # Explicit cleanup
+                        
+                        image_data = base64.b64encode(buf_value)
+                        del buf_value  # Free raw bytes immediately after encoding
                         break
                     else:
-                        print(f"Non-image response for tile ({row}, {col})")
-                        
-                except requests.exceptions.HTTPError as e:
-                    # Don't retry on 4xx client errors (auth/quota issues)
-                    if 400 <= e.response.status_code < 500:
-                        error_msg = str(e).replace(api_key, '***REDACTED***')
-                        print(f"Client error for tile ({row}, {col}): {error_msg}")
-                        print(f"ERROR: API key issue detected. Check billing, API enablement, and key restrictions.")
-                        break
-                    elif attempt < max_retries - 1:
-                        error_msg = str(e).replace(api_key, '***REDACTED***')
-                        print(f"Retry {attempt + 1} for tile ({row}, {col}): {error_msg}")
-                        time.sleep(backoff)
-                        backoff *= 2
-                    else:
-                        error_msg = str(e).replace(api_key, '***REDACTED***')
-                        print(f"Failed to download tile ({row}, {col}): {error_msg}")
+                        print("Non-image response for tile ({}, {})".format(row, col))
+                        r.close()
+                        del r
                 except Exception as e:
-                    if attempt < max_retries - 1:
-                        error_msg = str(e).replace(api_key, '***REDACTED***') if api_key in str(e) else str(e)
-                        print(f"Retry {attempt + 1} for tile ({row}, {col}): {error_msg}")
-                        time.sleep(backoff)
-                        backoff *= 2
+                    # Clean up response on error
+                    try:
+                        if 'r' in locals():
+                            r.close()
+                            del r
+                    except Exception:
+                        pass
+                    
+                    if attempt < 2:
+                        print("Retry {} for tile ({}, {}): {}".format(attempt + 1, row, col, e))
+                        time.sleep(1)
                     else:
-                        error_msg = str(e).replace(api_key, '***REDACTED***') if api_key in str(e) else str(e)
-                        print(f"Failed to download tile ({row}, {col}): {error_msg}")
+                        print("Failed tile ({}, {}): {}".format(row, col, e))
+
+            results.append({'row': row, 'col': col, 'image_data': image_data})
             
-            results.append({
-                'row': row,
-                'col': col,
-                'image_data': image_data
-            })
-            
-            if (idx + 1) % 10 == 0:
-                print(f"  Progress: {idx + 1}/{len(tile_requests)} tiles")
-        
-        print(f"Worker completed: {len([r for r in results if r['image_data']])} successful downloads")
+            # More frequent GC for large batches to prevent memory accumulation
+            gc_interval = 3 if batch_size >= 5 else 5  # Very frequent for large batches
+            if (idx + 1) % gc_interval == 0:
+                print("Progress: {}/{}".format(idx + 1, len(tile_requests)))
+                # Force garbage collection periodically for large batches
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
+
+        # Close session if we created one
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+        # Final memory cleanup before returning results
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+        ok = len([r for r in results if r.get('image_data')])
+        print("Worker completed: {} successful downloads".format(ok))
         return results

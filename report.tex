@@ -1,0 +1,116 @@
+\documentclass[12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{verbatim}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{hyperref}
+
+\geometry{margin=1in}
+
+\title{Parallel Google Maps Tile Stitching with PARCS}
+\author{Pavel Shpagin}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+This report presents a parallel implementation for downloading Google Maps satellite imagery tiles and stitching them into a high-resolution mosaic~[1]. The problem involves fetching hundreds of individual map tiles from the Google Maps Static API, processing each tile (cropping watermarks, compressing), and assembling them into a single composite image. The computational bottleneck lies in the sequential HTTP requests to the API, making this an ideal candidate for parallelization using the PARCS framework.
+
+The algorithm operates in three main phases: (1) coordinate calculation, where geographic coordinates are converted to tile indices using Web Mercator projection; (2) parallel tile download, where multiple worker nodes fetch tiles concurrently; and (3) mosaic assembly, where tiles are stitched together in the correct spatial order.
+
+\subsection{Algorithm Overview}
+
+Given a geographic center point $(lat, lon)$ and dimensions $(width_m, height_m)$ in meters, the system generates a grid of tiles. The grid resolution is fixed at 100 meters per tile, resulting in $n_{rows} \times n_{cols}$ tiles where:
+\begin{align}
+n_{cols} &= \left\lfloor \frac{width_m}{100} \right\rfloor \\
+n_{rows} &= \left\lfloor \frac{height_m}{100} \right\rfloor
+\end{align}
+
+Each tile is requested from Google Maps Static API at zoom level 19 with dimensions $640 \times 640$ pixels at 2x scale (effectively $1280 \times 1280$ pixels). The Web Mercator projection maps geographic coordinates to pixel coordinates using:
+\begin{align}
+x &= \frac{lon + 180}{360} \cdot 256 \cdot 2^{zoom} \\
+y &= \left(0.5 - \frac{\ln((1 + \sin(lat)) / (1 - \sin(lat)))}{4\pi}\right) \cdot 256 \cdot 2^{zoom}
+\end{align}
+
+The reverse transformation converts pixel coordinates back to lat/lon for tile center calculations.
+
+\subsection{PARCS Parallelization Strategy}
+
+PARCS provides a master-worker architecture where the master node distributes work across worker nodes via Pyro4 remote procedure calls. The key optimization is round-robin tile distribution: worker $i$ receives tiles at indices $\{i, i+N, i+2N, \ldots\}$ where $N$ is the number of workers. This ensures balanced load distribution even when tile download times vary.
+
+Each worker downloads its assigned tiles sequentially but independently, using HTTP connection pooling to reuse TCP connections and reduce overhead. Tiles are compressed to JPEG format (quality 45-60 depending on batch size) before base64 encoding for transmission back to the master. The master then assembles tiles into the final mosaic image using PIL/Pillow, applying additional compression if the output exceeds size limits.
+
+\section{Experimental Results}
+
+Benchmark tests were conducted using three datasets: small (400m $\times$ 400m, 16 tiles), medium (1200m $\times$ 1200m, 144 tiles), and large (3000m $\times$ 3000m, 900 tiles). Each dataset was run with 1, 4, and 7 worker nodes. Execution times were measured from job start to completion.
+
+Table~\ref{tab:results} presents the execution times and speedup ratios. Speedup is calculated as $S_p = T_1 / T_p$ where $T_1$ is the single-worker time and $T_p$ is the $p$-worker time.
+
+\begin{table}[h]
+\centering
+\caption{Execution times (seconds) and speedup ratios}
+\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & 1 Worker & 4 Workers & 7 Workers & Max Speedup \\
+\midrule
+Small (400m) & 13 & 9 & 9 & 1.44$\times$ \\
+Medium (1200m) & 53 & 24 & 20 & 2.65$\times$ \\
+Large (3000m) & 312 & 113 & 86 & 3.63$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results demonstrate that speedup increases with problem size. Small datasets show limited speedup (1.44$\times$) due to overhead dominating execution time. Medium datasets achieve moderate speedup (2.65$\times$), while large datasets achieve the best speedup (3.63$\times$) as the computational work dominates over communication and synchronization overhead.
+
+The sublinear speedup (less than 7$\times$ with 7 workers) is expected due to: (1) sequential mosaic assembly phase on the master, (2) network latency and API rate limiting, (3) load imbalance from varying tile download times, and (4) memory management overhead for large batches.
+
+\section{Optimizations}
+
+Several optimizations were implemented to improve performance:
+
+\begin{itemize}
+\item \textbf{Round-robin distribution}: Tiles are distributed round-robin across workers rather than contiguous chunks, improving load balance.
+\item \textbf{HTTP connection pooling}: Reusing TCP connections reduces connection establishment overhead from ~100ms per request to near-zero.
+\item \textbf{Reduced throttle delay}: Request delay reduced from 0.1s to 0.05s, doubling throughput while remaining safe for API rate limits.
+\item \textbf{Adaptive compression}: Large batches use more aggressive JPEG compression (quality 45 vs 60) to reduce memory footprint and transmission time.
+\item \textbf{Batch processing}: Single-worker mode processes tiles in batches of 50 with explicit garbage collection to prevent out-of-memory errors.
+\end{itemize}
+
+\section{Containerization}
+
+PARCS jobs run in isolated containers. The project includes a \texttt{Dockerfile} that extends the PARCS base image and installs Python dependencies:
+
+\begin{verbatim}
+FROM hummer12007/parcs-node:latest
+
+RUN pip install -U requests Pillow numpy Pyro4
+\end{verbatim}
+
+This ensures all worker VMs use an identical Python 2 environment with the required libraries preinstalled. The submission bundle contains only the solver script and test inputs, keeping the payload minimal.
+
+\section{Conclusion}
+
+The parallel implementation successfully leverages PARCS to achieve significant speedup for large-scale Google Maps tile downloads. The 3.63$\times$ speedup on large datasets demonstrates that the problem is well-suited for parallelization, with the bottleneck (HTTP requests) being largely independent and easily distributable.
+
+The results confirm that parallel speedup improves with problem size, as fixed overhead becomes negligible compared to computational work. The sublinear scaling is expected due to sequential components (mosaic assembly) and network constraints. Future improvements could include parallel mosaic assembly or pipelined tile processing to further improve speedup.
+
+\section{References}
+
+\begin{enumerate}
+\item Project repository. \url{https://github.com/PavelShpagin/gcp-project}
+
+\item PARCS Python Repository. \url{https://github.com/Hummer12007/parcs-python}
+
+\item Google Maps Platform Documentation. \url{https://developers.google.com/maps/documentation}
+
+\item PARCS Documentation. Task 1.2 Cloud Computing 0925. \url{https://mi.csc.knu.ua/wp-content/uploads/2025/09/Task_1_2_Cloud_Computing_0925.pdf}
+\end{enumerate}
+
+

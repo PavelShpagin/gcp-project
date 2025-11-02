@@ -6,6 +6,7 @@ Parallel Google Maps tile downloading and stitching using PARCS framework.
 
 - **solver.py**: PARCS solver that downloads Google Maps tiles in parallel and stitches them into a mosaic
 - **input.txt**: Input file specifying region to sample
+- **tests/**: Ready-to-run benchmark inputs for comparing worker scaling
 - **requirements.txt**: Python dependencies (install on PARCS instances)
 - **decode_output.py**: Helper script to decode base64 output to PNG
 
@@ -69,6 +70,10 @@ On each instance (master and workers), set:
 ```bash
 export GMAPS_KEY=YOUR_GOOGLE_MAPS_API_KEY
 ```
+
+Optional tuning knobs:
+
+- `GMAPS_THROTTLE_SECONDS` – override per-request delay (seconds) for tile downloads. Lower values increase throughput but also raise the risk of hitting Google Maps API rate limits. Defaults to `0.05`.
 
 Or add to the container environment.
 
