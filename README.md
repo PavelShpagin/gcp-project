@@ -72,7 +72,7 @@ This script handles everything: creates 3 clusters, runs experiments, aggregates
 
 | Experiment Type | Results Directory |
 |-----------------|-------------------|
-| Single-region baseline | `csharp\results_gcp_<timestamp>\results.csv` |
+| Single-region baseline | `csharp\results_gcp_<timestamp>\` |
 | Multi-region parallel | `csharp\results_multi_region_<timestamp>\` |
 | Federated split | `csharp\federated_results\federated_split_<timestamp>\` |
 
@@ -80,6 +80,20 @@ Each results folder contains:
 - `results.csv` - Timing data (input, points, download time, total time, speedup)
 - `log_*.txt` - Raw experiment logs
 - `summary.txt` - Human-readable summary
+
+### Stitched Map Output
+
+The actual stitched satellite map image is stored **on the remote GCP host** at `/home/<user>/parcsnet_run/out/`. To download it locally:
+
+```powershell
+# Download output files from host (add -DownloadOutputs flag)
+.\gcp\run_experiments_gcp.ps1 -HostInstance "parcsnet-baseline-host" -Zone "us-central1-a" -Points @(1) -Inputs @("tests\medium_district.txt") -DownloadOutputs
+
+# Or manually via SCP (while cluster is running):
+scp -i ~/.ssh/google_compute_engine <user>@<host-external-ip>:~/parcsnet_run/out/* ./output/
+```
+
+The output file is a text file containing base64-encoded tile data. For the federated experiments (`--downloadonly` mode), tiles are saved as JSON for local merging.
 
 ## Performance Results
 
