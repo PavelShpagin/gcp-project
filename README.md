@@ -29,25 +29,57 @@ $env:GMAPS_KEY = "YOUR_GOOGLE_MAPS_API_KEY"
 gcloud services enable compute.googleapis.com
 ```
 
-### 2. Deploy multi-region clusters (for 5x+ speedup)
+### 2. Run baseline (1 region, 1 point)
+
+This creates a cluster, runs the experiment, saves results, and tears down:
+
+```powershell
+# Create single cluster with 1 daemon
+.\gcp\parcsnet_cluster.ps1 -Action up -ClusterName "parcsnet-baseline" -Daemons 1 -Zone "us-central1-a"
+
+# Run experiment with 1 point on medium dataset
+.\gcp\run_experiments_gcp.ps1 -HostInstance "parcsnet-baseline-host" -Zone "us-central1-a" -Points @(1) -Inputs @("tests\medium_district.txt")
+
+# Results saved to: csharp\results_gcp_<timestamp>\results.csv
+
+# Cleanup (delete cluster to stop billing)
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-baseline" -Zone "us-central1-a"
+```
+
+### 3. Run multi-region federated (5x+ speedup)
+
+This script handles everything: creates 3 clusters, runs experiments, aggregates results, then you manually cleanup:
 
 ```powershell
 # Deploy 3 clusters across regions (us-east1, us-west1, europe-west1)
-# Each cluster has 1 host + 3 daemons with independent external IPs
+# Each cluster: 1 host + 3 daemons with independent external IPs
 .\gcp\run_multi_region_experiments.ps1
-```
 
-### 3. Run federated experiment
+# Results saved to: csharp\results_multi_region_<timestamp>\
 
-```powershell
-# Split 144 tiles across 3 regions (48 tiles each)
-# Achieves 5.2x speedup vs single-point baseline
+# Run federated tile-splitting experiment (splits 144 tiles across regions)
 .\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt
+
+# Results saved to: csharp\federated_results\federated_split_<timestamp>\
+
+# Cleanup all clusters when done
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-east1" -Zone "us-east1-c"
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-west1" -Zone "us-west1-a"
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-europe-west1" -Zone "europe-west1-b"
 ```
 
-### 4. View results
+## Results Location
 
-Results are saved to `csharp\federated_results\federated_split_*\`
+| Experiment Type | Results Directory |
+|-----------------|-------------------|
+| Single-region baseline | `csharp\results_gcp_<timestamp>\results.csv` |
+| Multi-region parallel | `csharp\results_multi_region_<timestamp>\` |
+| Federated split | `csharp\federated_results\federated_split_<timestamp>\` |
+
+Each results folder contains:
+- `results.csv` - Timing data (input, points, download time, total time, speedup)
+- `log_*.txt` - Raw experiment logs
+- `summary.txt` - Human-readable summary
 
 ## Performance Results
 
@@ -64,13 +96,16 @@ The key insight: Google Maps API rate-limits per external IP. Multi-region deplo
 ```
 gcp-project/
 ├── gcp/                          # GCP automation scripts
-│   ├── parcsnet_cluster.ps1      # Single cluster management
+│   ├── parcsnet_cluster.ps1      # Create/delete single cluster
+│   ├── run_experiments_gcp.ps1   # Run experiments on existing cluster
 │   ├── run_multi_region_experiments.ps1  # Multi-region orchestration
 │   ├── run_federated_split.ps1   # Federated tile-splitting experiment
 │   └── README.md                 # GCP scripts documentation
 ├── csharp/                       # PARCS.NET implementation
 │   ├── ParcsNetMapsStitcher/     # C# module source code
-│   └── federated_results/        # Experiment results
+│   ├── results_gcp_*/            # Single-region results (gitignored)
+│   ├── results_multi_region_*/   # Multi-region results (gitignored)
+│   └── federated_results/        # Federated experiment results (gitignored)
 ├── tests/                        # Benchmark input files
 │   ├── small_city_block.txt      # 16 tiles (400m x 400m)
 │   └── medium_district.txt       # 144 tiles (1200m x 1200m)
@@ -100,17 +135,15 @@ Example (`tests/medium_district.txt`):
 0
 ```
 
-## Alternative: Single-Region Setup
+## Script Reference
 
-For simpler setups (lower speedup due to API throttling):
-
-```powershell
-# Spin up single cluster with 7 daemons
-.\gcp\spin_up_cluster.ps1 -Daemons 7
-
-# Run experiments
-.\gcp\run_all_experiments.ps1
-```
+| Script | Purpose | Creates Cluster | Runs Experiment | Deletes Cluster |
+|--------|---------|-----------------|-----------------|-----------------|
+| `parcsnet_cluster.ps1 -Action up` | Create cluster | Yes | No | No |
+| `parcsnet_cluster.ps1 -Action down` | Delete cluster | No | No | Yes |
+| `run_experiments_gcp.ps1` | Run on existing cluster | No | Yes | No |
+| `run_multi_region_experiments.ps1` | Full multi-region flow | Yes | Yes | No |
+| `run_federated_split.ps1` | Federated experiment | No | Yes | No |
 
 ## Python PARCS (Original)
 
@@ -122,15 +155,6 @@ pip install -r requirements.txt
 
 # Run via PARCS web UI or CLI
 python solver.py
-```
-
-## Cleanup
-
-```powershell
-# Delete all clusters to stop billing
-.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-east1"
-.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-west1"
-.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-europe-west1"
 ```
 
 ## Reports
