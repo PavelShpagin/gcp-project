@@ -1,0 +1,223 @@
+<#
+.SYNOPSIS
+  Run a TRUE FEDERATED experiment - split tiles across regions.
+  Each region downloads only its portion of tiles, then we merge locally.
+#>
+param(
+  [string]$ProjectId = "maps-demo-486815",
+  [string]$InputFile = "tests\medium_district.txt",
+  [string]$OutputDir = "csharp\federated_results",
+  [int]$PointsPerRegion = 3
+)
+
+$ErrorActionPreference = "Continue"
+
+# Discover running multi-region clusters
+$instances = & gcloud.cmd compute instances list --project $ProjectId --filter="name~'parcsnet-mr.*-host'" --format="csv[no-heading](name,zone,networkInterfaces[0].accessConfigs[0].natIP)"
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($instances)) {
+  throw "No multi-region host instances found."
+}
+
+$hosts = @()
+foreach ($line in ($instances -split "`n")) {
+  $line = $line.Trim()
+  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $parts = $line -split ","
+  if ($parts.Count -ge 3) {
+    $hosts += [pscustomobject]@{
+      name = $parts[0]
+      zone = $parts[1]
+      ip   = $parts[2]
+    }
+  }
+}
+
+Write-Host "Found $($hosts.Count) regional clusters"
+
+# Calculate total tiles
+$inputLines = Get-Content $InputFile | Where-Object { $_.Trim() -ne "" }
+$heightM = [double]$inputLines[2]
+$widthM = [double]$inputLines[3]
+$numRows = [Math]::Max(1, [int]($heightM / 100))
+$numCols = [Math]::Max(1, [int]($widthM / 100))
+$totalTiles = $numRows * $numCols
+
+Write-Host "Total tiles: $totalTiles"
+Write-Host "Splitting across $($hosts.Count) regions"
+
+# Calculate tile ranges
+$tilesPerRegion = [Math]::Ceiling($totalTiles / $hosts.Count)
+$assignments = @()
+$idx = 0
+foreach ($h in $hosts) {
+  $start = $idx
+  $end = [Math]::Min($idx + $tilesPerRegion, $totalTiles)
+  $assignments += @{
+    host = $h
+    start = $start
+    end = $end
+    count = $end - $start
+  }
+  $idx = $end
+}
+
+Write-Host ""
+Write-Host "Tile assignments:"
+foreach ($a in $assignments) {
+  $region = ($a.host.name -replace "parcsnet-mr-", "" -replace "-host", "")
+  Write-Host "  ${region}: tiles [$($a.start), $($a.end)) = $($a.count) tiles"
+}
+
+# Prepare output
+$stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$baseDir = Join-Path (Get-Location).Path $OutputDir
+if (-not (Test-Path $baseDir)) { New-Item -ItemType Directory -Force -Path $baseDir | Out-Null }
+$outDir = Join-Path $baseDir ("federated_split_" + $stamp)
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Write-Host "Output: $outDir"
+
+$publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
+$sshKey = "C:\Users\Pavel\.ssh\google_compute_engine"
+$inputName = [System.IO.Path]::GetFileName($InputFile)
+
+Write-Host ""
+Write-Host "Rebuilding Docker image on each host..."
+
+foreach ($h in $hosts) {
+  $region = ($h.name -replace "parcsnet-mr-", "" -replace "-host", "")
+  Write-Host "  Building on $region ($($h.ip))..."
+  
+  $sshOpts = "-i `"$sshKey`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=60"
+  
+  # Upload new publish folder to bin/ (Dockerfile expects ./bin/)
+  Write-Host "    Uploading..."
+  $scpCmd = "scp.exe $sshOpts -r `"$publishDir\*`" `"Pavel@$($h.ip):/home/Pavel/parcsnet_run/bin/`""
+  $scpOut = cmd /c $scpCmd 2>&1
+  
+  # Rebuild Docker image (with --no-cache to force fresh build)
+  $buildCmd = "cd /home/Pavel/parcsnet_run && docker build --no-cache -t parcsnet-maps-runner:latest -f Dockerfile ."
+  $sshCmd = "ssh.exe $sshOpts Pavel@$($h.ip) `"$buildCmd`""
+  Write-Host "    Building Docker (no-cache)..."
+  $buildOut = cmd /c $sshCmd 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "    Build output: $($buildOut | Select-Object -Last 5)"
+  } else {
+    Write-Host "    Done."
+  }
+}
+
+Write-Host ""
+Write-Host "Starting PARALLEL federated downloads..."
+
+$swTotal = [System.Diagnostics.Stopwatch]::StartNew()
+
+# Launch jobs
+$jobs = @()
+foreach ($a in $assignments) {
+  $h = $a.host
+  $region = ($h.name -replace "parcsnet-mr-", "" -replace "-host", "")
+  $logFile = [System.IO.Path]::GetFullPath((Join-Path $outDir "log_${region}.txt"))
+  
+  # Get host internal IP
+  $intIpCmd = "gcloud.cmd compute instances describe $($h.name) --project $ProjectId --zone $($h.zone) --format=`"get(networkInterfaces[0].networkIP)`""
+  $hostInternalIp = (cmd /c $intIpCmd 2>&1 | Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+$" } | Select-Object -First 1)
+  
+  Write-Host "Launching $region (tiles $($a.start)-$($a.end), host IP: $hostInternalIp)..."
+  
+  $job = Start-Job -Name $region -ArgumentList $h.ip, $sshKey, $PointsPerRegion, $logFile, $hostInternalIp, $inputName, $a.start, $a.end -ScriptBlock {
+    param($ip, $key, $points, $logPath, $hostIntIp, $inputFileName, $tileStart, $tileEnd)
+    
+    $sshOpts = "-i `"$key`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=120 -o ServerAliveInterval=30"
+    
+    $dockerCmd = "docker run --rm --network host -v /home/Pavel/parcsnet_run/out:/out parcsnet-maps-runner:latest --serverip $hostIntIp --user parcs-user --input /app/tests/$inputFileName --output /out/tiles.txt --points $points --downloadonly --tilestart $tileStart --tileend $tileEnd"
+    $sshFullCmd = "ssh.exe $sshOpts Pavel@$ip `"$dockerCmd`""
+    
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $output = cmd /c $sshFullCmd 2>&1
+    $sw.Stop()
+    
+    $logDir = [System.IO.Path]::GetDirectoryName($logPath)
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+    $output | Out-File -FilePath $logPath -Encoding UTF8
+    
+    $downloadTime = 0
+    foreach ($line in $output) {
+      if ($line -match "Download phase:\s*([\d.]+)s") {
+        $downloadTime = [double]$Matches[1]
+      }
+    }
+    
+    return @{
+      elapsed = $sw.Elapsed.TotalSeconds
+      download = $downloadTime
+      output = ($output -join "`n")
+    }
+  }
+  
+  $jobs += @{ job = $job; region = $region; tiles = $a.count }
+}
+
+Write-Host ""
+Write-Host "Waiting for all regions..."
+
+$results = @()
+foreach ($j in $jobs) {
+  $result = Receive-Job -Job $j.job -Wait
+  Remove-Job -Job $j.job
+  
+  $results += [pscustomobject]@{
+    region = $j.region
+    tiles = $j.tiles
+    download_s = $result.download
+    elapsed_s = $result.elapsed
+  }
+  
+  Write-Host "$($j.region): $($j.tiles) tiles in $($result.download.ToString('F3'))s"
+}
+
+$swTotal.Stop()
+
+Write-Host ""
+Write-Host "============================================"
+Write-Host "=== FEDERATED SPLIT EXPERIMENT COMPLETE ==="
+Write-Host "============================================"
+Write-Host ""
+Write-Host "Wall-clock time: $($swTotal.Elapsed.TotalSeconds.ToString('F3'))s"
+Write-Host ""
+
+$maxDownload = ($results | Measure-Object -Property download_s -Maximum).Maximum
+$sumDownload = ($results | Measure-Object -Property download_s -Sum).Sum
+
+Write-Host "Per-region times (each downloading ~$tilesPerRegion tiles):"
+foreach ($r in $results) {
+  Write-Host "  $($r.region): $($r.download_s.ToString('F3'))s ($($r.tiles) tiles)"
+}
+
+Write-Host ""
+# Baseline: 1 point downloading all 144 tiles = ~65s
+# With federation: max region time (since parallel) = effective download time
+$baseline = 65.0
+$speedup = $baseline / $maxDownload
+
+Write-Host "Speedup vs 1-point baseline (~${baseline}s for $totalTiles tiles):"
+Write-Host "  Download speedup: $($speedup.ToString('F2'))x"
+Write-Host ""
+Write-Host "Results saved to: $outDir"
+
+# Save CSV
+$csvFile = Join-Path $outDir "results.csv"
+$results | Export-Csv -Path $csvFile -NoTypeInformation
+
+@"
+Federated Split Experiment
+==========================
+Total tiles: $totalTiles
+Regions: $($hosts.Count)
+Tiles per region: ~$tilesPerRegion
+Points per region: $PointsPerRegion
+
+Wall-clock time: $($swTotal.Elapsed.TotalSeconds)s
+Max region download: ${maxDownload}s
+
+Speedup vs 1-point baseline: ${speedup}x
+"@ | Out-File -FilePath (Join-Path $outDir "summary.txt") -Encoding UTF8

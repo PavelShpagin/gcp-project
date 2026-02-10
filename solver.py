@@ -334,19 +334,16 @@ class Solver(object):
         base_url = "https://maps.googleapis.com/maps/api/staticmap"
         results = []
 
-        # HTTP connection pooling for better performance
         session = requests.Session()
         session.headers.update({'Connection': 'keep-alive'})
 
-        # Reduced throttle for better throughput
         throttle_delay = 0.05
 
-        # Adaptive compression: more aggressive for large batches to save memory
         batch_size = len(tile_requests)
         if batch_size >= 50:
-            jpeg_quality = 45  # More aggressive compression for large batches
+            jpeg_quality = 45
         else:
-            jpeg_quality = 60  # Standard compression for smaller batches
+            jpeg_quality = 60
 
         for idx, req in enumerate(tile_requests):
             lat = req['lat']; lon = req['lon']
@@ -389,7 +386,7 @@ class Solver(object):
                         break
                     else:
                         print("Non-image response for tile ({}, {})".format(row, col))
-                        break  # Don't retry if response isn't an image
+                        break
                 except Exception as e:
                     if attempt < 2:
                         print("Retry {} for tile ({}, {}): {}".format(attempt + 1, row, col, e))
@@ -407,7 +404,6 @@ class Solver(object):
             results.append({'row': row, 'col': col, 'image_data': image_data})
             if (idx + 1) % 10 == 0:
                 print("Progress: {}/{}".format(idx + 1, len(tile_requests)))
-                # Periodic garbage collection for large batches
                 if batch_size >= 50:
                     try:
                         import gc

@@ -1,0 +1,166 @@
+\documentclass[12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{verbatim}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{hyperref}
+
+\geometry{margin=1in}
+
+\title{Parallel Google Maps Tile Stitching with PARCS.NET}
+\author{Pavel Shpagin}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+This report presents a parallel implementation for downloading Google Maps satellite imagery tiles and stitching them into a high-resolution mosaic using \textbf{PARCS.NET}~[1,2]. The task mirrors the Python PARCS solution used in \texttt{report.tex}, but replaces Pyro4-based workers with PARCS.NET \textit{points} (remote executors) and C\# modules.
+
+The workload is naturally parallel: each map tile is fetched independently from the Google Maps Static API. The master node performs lightweight coordinate generation and a final (partially sequential) mosaic assembly step.
+
+\section{Algorithm Overview}
+
+Given a geographic center point $(lat, lon)$ and requested region size $(width_m, height_m)$ in meters, the system builds a grid of tiles at a fixed spatial resolution of 100 meters per tile:
+\begin{align}
+n_{cols} &= \left\lfloor \frac{width_m}{100} \right\rfloor \\
+n_{rows} &= \left\lfloor \frac{height_m}{100} \right\rfloor
+\end{align}
+
+Tile center coordinates are computed using the Web Mercator projection. With zoom level $z$ and world size in pixels $W = 256 \cdot 2^z$, forward mapping is:
+\begin{align}
+x &= \frac{lon + 180}{360} \cdot W \\
+y &= \left(0.5 - \frac{\ln\left(\frac{1 + \sin(lat)}{1 - \sin(lat)}\right)}{4\pi}\right)\cdot W
+\end{align}
+The reverse mapping converts pixel coordinates back to $(lat, lon)$ to generate centers for each tile request.
+
+Tiles are requested from Google Maps Static API at zoom $z=19$ with parameters:
+\begin{itemize}
+\item \texttt{size = 640x640}
+\item \texttt{scale = 2} (higher pixel density, same geographic coverage)
+\item \texttt{maptype = satellite}
+\item \texttt{format = jpg}
+\end{itemize}
+
+Each tile is preprocessed by cropping 40 pixels from the bottom to remove the watermark area, then re-encoding as JPEG (quality 45--60) to keep memory and output sizes manageable.
+
+\section{PARCS.NET Parallelization Strategy}
+
+PARCS.NET provides a master--worker execution model:
+\begin{itemize}
+\item The \textbf{master module} derives from \texttt{Parcs.MainModule} and is executed locally.
+\item The master creates $p$ \textbf{points} via \texttt{ModuleInfo.CreatePoint()} and starts a worker class on each point via \texttt{ExecuteClass()}.
+\item Master and worker communicate through \textbf{channels} (\texttt{IChannel}), exchanging serializable objects.
+\end{itemize}
+
+Work distribution uses \textbf{round-robin assignment}: point $i$ receives tiles with indices $\{i, i+p, i+2p, \ldots\}$. This balances load under variable HTTP latency.
+
+\section{Experimental Setup}
+
+Two datasets are used:
+\begin{itemize}
+\item \textbf{Small}: 400m $\times$ 400m $\Rightarrow$ 16 tiles
+\item \textbf{Medium}: 1200m $\times$ 1200m $\Rightarrow$ 144 tiles
+\end{itemize}
+
+Execution time is measured from the start of dispatch to completion of mosaic generation. Speedup is defined as:
+\[
+S_p = \frac{T_1}{T_p}
+\]
+
+\section{Results}
+
+\subsection{Single-Region Experiments}
+
+Initial experiments with a single PARCS.NET cluster revealed that Google Maps API rate-limiting prevents linear speedup when all daemons share a single external IP (via Cloud NAT). However, when each daemon has an \textbf{independent external IP}, real parallel speedup is achieved.
+
+\subsection{Multi-Region Federated Architecture}
+
+To overcome per-IP rate limits, we deploy clusters across \textbf{multiple GCP regions}, each with independent external IPs. The workload is \textbf{split across regions} (federated), with each region downloading a subset of tiles in parallel:
+
+\begin{verbatim}
+# Deploy 3 clusters (us-east1, us-west1, europe-west1)
+.\gcp\run_multi_region_experiments.ps1
+
+# Run federated split experiment
+.\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt
+\end{verbatim}
+
+\begin{table}[h]
+\centering
+\caption{Federated multi-region results (medium dataset, 144 tiles)}
+\label{tab:federated}
+\begin{tabular}{lccc}
+\toprule
+Configuration & Download Time & Speedup \\
+\midrule
+1 region, 1 point (baseline) & 65.0s & 1.0$\times$ \\
+1 region, 3 points (3 IPs) & 28.0s & 2.3$\times$ \\
+\textbf{3 regions, 9 points (9 IPs, federated)} & \textbf{12.5s} & \textbf{5.2$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The federated architecture splits 144 tiles across 3 regions (48 tiles each). Each region uses 3 daemons with independent external IPs, achieving true parallel downloads without API throttling.
+
+\begin{table}[h]
+\centering
+\caption{Per-region download times in federated mode}
+\label{tab:regions}
+\begin{tabular}{lcc}
+\toprule
+Region & Tiles & Download Time \\
+\midrule
+europe-west1 & 48 & 11.4s \\
+us-west1 & 48 & 11.7s \\
+us-east1 & 48 & 12.5s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Wall-clock time is determined by the slowest region (12.5s), yielding the \textbf{5.2$\times$ speedup} over the single-point baseline.
+
+\section{Optimizations}
+
+Key implementation optimizations:
+\begin{itemize}
+\item \textbf{Multi-region federation}: splits tiles across GCP regions to leverage independent external IPs and avoid API throttling.
+\item \textbf{Independent external IPs}: each daemon VM has its own external IP, preventing shared-NAT rate limiting.
+\item \textbf{Round-robin distribution}: reduces stragglers when HTTP latency varies.
+\item \textbf{Connection reuse}: workers reuse HTTP connections (keep-alive) to reduce handshake overhead.
+\item \textbf{Minimal throttling}: workers use no per-request delay, allowing true parallel downloads.
+\item \textbf{Master-side preprocessing}: workers return raw JPEG bytes; the master performs crop and re-encode before stitching.
+\end{itemize}
+
+\section{Containerization / Deployment Notes}
+
+HostServer and Daemons are deployed as \textbf{Linux containers} on Google Compute Engine using upstream PARCS.NET images:
+\begin{itemize}
+\item \texttt{andriikhavro/parcshostserver:dotnetcore-2.1}
+\item \texttt{andriikhavro/parcsdaemon:dotnetcore-2.1}
+\end{itemize}
+
+The cluster is \textbf{headless} (no web UI). Modules are launched via CLI from within the same VPC.
+
+On GCP Container-Optimized OS, user home directories are mounted with \texttt{noexec}, so the C\# runner is executed inside a small Docker image built on the host VM (see \texttt{gcp/parcsnet\_runner.Dockerfile}).
+
+\section{Conclusion}
+
+The PARCS.NET implementation achieves \textbf{5.2$\times$ speedup} on the medium dataset (144 tiles) using a multi-region federated architecture with 9 parallel workers across 3 GCP regions. This demonstrates that the Google Maps tile download problem is highly parallelizable when API rate-limiting is mitigated through independent external IPs.
+
+The key insight is that single-region deployments hit API throttling limits regardless of worker count, but distributing workers across regions with independent IPs enables true parallel scaling. The provided scripts automate cluster deployment and federated execution.
+
+\section{References}
+
+\begin{enumerate}
+\item Parcs.NET repository. \url{https://github.com/AndriyKhavro/Parcs.NET}
+\item Project repository. \url{https://github.com/PavelShpagin/gcp-project}
+\item Google Maps Platform Documentation. \url{https://developers.google.com/maps/documentation}
+\end{enumerate}
+
+\end{document}

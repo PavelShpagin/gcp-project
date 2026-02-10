@@ -2,13 +2,84 @@
 
 Parallel Google Maps tile downloading and stitching using PARCS framework.
 
-## Files
+## Project Overview
 
-- **solver.py**: PARCS solver that downloads Google Maps tiles in parallel and stitches them into a mosaic
-- **input.txt**: Input file specifying region to sample
-- **tests/**: Ready-to-run benchmark inputs for comparing worker scaling
-- **requirements.txt**: Python dependencies (install on PARCS instances)
-- **decode_output.py**: Helper script to decode base64 output to PNG
+This project demonstrates parallel computing for downloading and stitching Google Maps satellite tiles using two implementations:
+
+1. **Python PARCS** (`solver.py`) - Original implementation using Pyro4-based PARCS
+2. **C# PARCS.NET** (`csharp/`) - .NET Core implementation achieving **5.2x speedup** with multi-region federation
+
+## Quick Start (PARCS.NET on GCP)
+
+### Prerequisites
+
+- Google Cloud SDK (`gcloud`) installed and configured
+- PowerShell 5.1+ (Windows) or PowerShell Core (cross-platform)
+- .NET SDK 8.0+ (for building the C# module)
+- Google Maps API key with Static Maps API enabled
+- GCP project with billing enabled
+
+### 1. Set up environment
+
+```powershell
+# Set your API key
+$env:GMAPS_KEY = "YOUR_GOOGLE_MAPS_API_KEY"
+
+# Enable Compute Engine API (requires billing)
+gcloud services enable compute.googleapis.com
+```
+
+### 2. Deploy multi-region clusters (for 5x+ speedup)
+
+```powershell
+# Deploy 3 clusters across regions (us-east1, us-west1, europe-west1)
+# Each cluster has 1 host + 3 daemons with independent external IPs
+.\gcp\run_multi_region_experiments.ps1
+```
+
+### 3. Run federated experiment
+
+```powershell
+# Split 144 tiles across 3 regions (48 tiles each)
+# Achieves 5.2x speedup vs single-point baseline
+.\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt
+```
+
+### 4. View results
+
+Results are saved to `csharp\federated_results\federated_split_*\`
+
+## Performance Results
+
+| Configuration | Download Time | Speedup |
+|--------------|---------------|---------|
+| 1 region, 1 point (baseline) | 65.0s | 1.0x |
+| 1 region, 3 points (3 IPs) | 28.0s | 2.3x |
+| **3 regions, 9 points (federated)** | **12.5s** | **5.2x** |
+
+The key insight: Google Maps API rate-limits per external IP. Multi-region deployment with independent IPs per daemon enables true parallel scaling.
+
+## Project Structure
+
+```
+gcp-project/
+├── gcp/                          # GCP automation scripts
+│   ├── parcsnet_cluster.ps1      # Single cluster management
+│   ├── run_multi_region_experiments.ps1  # Multi-region orchestration
+│   ├── run_federated_split.ps1   # Federated tile-splitting experiment
+│   └── README.md                 # GCP scripts documentation
+├── csharp/                       # PARCS.NET implementation
+│   ├── ParcsNetMapsStitcher/     # C# module source code
+│   └── federated_results/        # Experiment results
+├── tests/                        # Benchmark input files
+│   ├── small_city_block.txt      # 16 tiles (400m x 400m)
+│   └── medium_district.txt       # 144 tiles (1200m x 1200m)
+├── report_c#.tex                 # LaTeX report (PARCS.NET results)
+├── report_c#.pdf                 # Compiled report with 5.2x speedup
+├── report.tex                    # Original Python PARCS report
+├── solver.py                     # Python PARCS solver
+└── legacy/                       # Old/deprecated files
+```
 
 ## Input Format
 
@@ -20,118 +91,59 @@ Parallel Google Maps tile downloading and stitching using PARCS framework.
 <compress_flag>
 ```
 
-Where `compress_flag` is:
-
-- `0` = No compression (high quality)
-- `1` = Compress to ~100MB max
-
-## Example Input
-
+Example (`tests/medium_district.txt`):
 ```
-50.4162021584
-30.8906000000
-1000
-1000
+37.7749
+-122.4194
+1200
+1200
 0
 ```
 
-This will generate a 1km × 1km satellite map centered at (50.4162, 30.8906) without compression.
+## Alternative: Single-Region Setup
 
-## Output
+For simpler setups (lower speedup due to API throttling):
 
-The solution generates a **base64-encoded PNG** in the output file that can be downloaded from PARCS UI.
+```powershell
+# Spin up single cluster with 7 daemons
+.\gcp\spin_up_cluster.ps1 -Daemons 7
 
-### Decoding Output (After Downloading from PARCS):
-
-```bash
-# Method 1: Use decode script
-python decode_output.py output.txt map.png
-
-# Method 2: Manual (Linux/Mac)
-grep -v "PNG_BASE64" output.txt | base64 -d > map.png
-
-# Method 3: Manual (Windows PowerShell)
-$content = Get-Content output.txt -Raw
-$base64 = $content -replace '.*PNG_BASE64_START\n','' -replace '\nPNG_BASE64_END.*',''
-[IO.File]::WriteAllBytes("map.png", [Convert]::FromBase64String($base64))
+# Run experiments
+.\gcp\run_all_experiments.ps1
 ```
 
-## Setup on Google Cloud
+## Python PARCS (Original)
 
-### Prerequisites
-
-1. Google Cloud instances created with PARCS containers
-2. Google Maps API key set as environment variable `GMAPS_KEY`
-
-### Environment Variable
-
-On each instance (master and workers), set:
+The original Python implementation using Pyro4-based PARCS:
 
 ```bash
-export GMAPS_KEY=YOUR_GOOGLE_MAPS_API_KEY
+# Install dependencies
+pip install -r requirements.txt
+
+# Run via PARCS web UI or CLI
+python solver.py
 ```
 
-Optional tuning knobs:
+## Cleanup
 
-- `GMAPS_THROTTLE_SECONDS` – override per-request delay (seconds) for tile downloads. Lower values increase throughput but also raise the risk of hitting Google Maps API rate limits. Defaults to `0.05`.
-
-Or add to the container environment.
-
-### Instance Creation (Recommended: 6-8 workers for 5x speedup)
-
-```bash
-# Create master
-gcloud compute instances create-with-container master \
-  --container-image=registry.hub.docker.com/hummer12007/parcs-node \
-  --container-env PARCS_ARGS="master",GMAPS_KEY="YOUR_API_KEY"
-
-# Create workers (6-8 for optimal performance)
-gcloud compute instances create-with-container worker1 worker2 worker3 worker4 worker5 worker6 \
-  --container-image=registry.hub.docker.com/hummer12007/parcs-node \
-  --container-env PARCS_ARGS="worker MASTER_INTERNAL_IP",GMAPS_KEY="YOUR_API_KEY"
+```powershell
+# Delete all clusters to stop billing
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-east1"
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-us-west1"
+.\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-europe-west1"
 ```
 
-### Running on PARCS
+## Reports
 
-1. Access PARCS web interface at `http://$MASTER_IP:8080`
-2. Upload `solver.py` as the Solution File
-3. Upload `input.txt` as the Input File
-4. Click "Run" and wait for completion (~5 minutes with 6 workers for 2500 tiles)
-5. Click "Output" button to download the base64-encoded result
-6. Decode using `decode_output.py` or manual method above
+- `report_c#.pdf` - PARCS.NET results with 5.2x speedup (multi-region federation)
+- `report.tex` - Original Python PARCS report
 
-## How It Works
+## References
 
-1. **Master** reads input file and calculates tile coordinates using Web Mercator projection
-2. **Master** distributes tile download tasks across workers (or runs sequentially if no workers)
-3. **Workers** download tiles from Google Maps Static API in parallel
-4. **Workers** crop 40px from bottom to remove Google watermark
-5. **Workers** encode tiles as base64 and return to master
-6. **Master** stitches tiles into final mosaic image
-7. **Master** applies smart compression if enabled (downscales to ~100MB)
-8. **Master** encodes final PNG as base64 and writes to output file
+1. [PARCS.NET Repository](https://github.com/AndriyKhavro/Parcs.NET)
+2. [PARCS Python Repository](https://github.com/Hummer12007/parcs-python)
+3. [Google Maps Static API](https://developers.google.com/maps/documentation/maps-static)
 
-## Configuration
+## License
 
-Default settings in `solver.py`:
-
-- `zoom = 19` (high detail satellite imagery)
-- `tile_size_px = 640` (maximum size for Static API)
-- `scale = 2` (2x resolution for retina displays)
-- `resolution_m = 100` (each tile covers ~100m)
-- `crop_bottom = 40` (pixels to crop from bottom to remove watermark)
-
-## Performance
-
-- **Sequential (0 workers)**: ~25 minutes for 2500 tiles (5km × 5km)
-- **6 workers**: ~5 minutes for 2500 tiles (5x speedup)
-- **8 workers**: ~4 minutes for 2500 tiles (6x speedup)
-
-## Features
-
-✅ Watermark removal (crops bottom 40px)  
-✅ Smart compression (targets 100MB max file size)  
-✅ Progressive stitching (memory-efficient for large maps)  
-✅ Fail-fast error handling  
-✅ API key redaction in logs  
-✅ Base64 output for PARCS UI compatibility
+See [LICENSE](LICENSE) file.

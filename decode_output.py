@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Decode base64-encoded PNG from PARCS output file
+Decode base64-encoded image (PNG/JPEG) from PARCS output file
 Compatible with Python 2.7 and Python 3.x
 Usage: python decode_output.py output.txt map.png
+       python decode_output.py output.txt map.jpg
 """
 from __future__ import print_function
 import sys
@@ -37,7 +38,7 @@ def decode_png(input_file, output_file):
         f.write(png_data)
     
     size_mb = len(png_data) / (1024.0 * 1024.0)
-    print("Successfully decoded {:.2f} MB PNG to {}".format(size_mb, output_file))
+    print("Successfully decoded {:.2f} MB image to {}".format(size_mb, output_file))
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:

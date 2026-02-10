@@ -1,0 +1,44 @@
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.python-version
+uv.lock
+
+# .NET
+**/bin/
+**/obj/
+.vs/
+
+# Generated outputs and experiment results
+csharp/results_*/
+csharp/federated_results/
+*.log
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.toc
+*.synctex.gz
+report_c#.tex.bak_*
+
+# Local tools
+.tools/
+tectonic/
+
+# Legacy/deprecated files
+legacy/
+
+# Temporary files
+tmp_*
+*.tmp
+
+# Large output files (keep report PDF)
+map.png
+output.txt
+
+# IDE
+.idea/
+*.swp
