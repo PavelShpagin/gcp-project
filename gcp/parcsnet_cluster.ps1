@@ -323,12 +323,77 @@ if ($CreateRunner) {
   }
 }
 
+# Get host external IP for SSH
+$hostNatIp = (& $script:GcloudCmdPath compute instances describe $hostName --zone $Zone --format="get(networkInterfaces[0].accessConfigs[0].natIP)" 2>$null)
+if ([string]::IsNullOrWhiteSpace($hostNatIp)) {
+  Write-Host "WARNING: Host has no external IP. Cannot build runner image automatically."
+  Write-Host "Cluster is up (without runner image)."
+  exit 0
+}
+$hostNatIp = $hostNatIp.Trim()
+
+# Build and deploy runner Docker image
 Write-Host ""
-Write-Host "Cluster is up."
-Write-Host "HostServer internal IP (use as --serverip from a VM in the same VPC): $hostInternalIp"
+Write-Host "Building and deploying runner Docker image..."
+
+$sshUser = $env:USERNAME
+$sshKeyPath = Join-Path $env:USERPROFILE ".ssh\google_compute_engine"
+$publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
+
+# Publish C# code
+Write-Host "Publishing C# module..."
+dotnet publish .\csharp\ParcsNetMapsStitcher\ParcsNetMapsStitcher.csproj -c Release -f netcoreapp2.1 -r linux-x64 --self-contained true
+if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed." }
+
+if (-not (Test-Path $publishDir)) {
+  throw "Publish output not found: $publishDir"
+}
+
+$sshOpts = "-i `"$sshKeyPath`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=30"
+
+# Wait for VM to be ready for SSH
+Write-Host "Waiting for host VM to be SSH-ready..."
+$maxRetries = 12
+for ($retry = 1; $retry -le $maxRetries; $retry++) {
+  $testCmd = "ssh.exe $sshOpts -T -n $sshUser@$hostNatIp `"echo ready`""
+  $testOut = cmd /c $testCmd 2>&1
+  if ($LASTEXITCODE -eq 0) { break }
+  Write-Host "  Attempt $retry/$maxRetries - waiting..."
+  Start-Sleep -Seconds 10
+}
+
+# Create directories
+Write-Host "Preparing remote workspace..."
+$mkdirCmd = "ssh.exe $sshOpts -T -n $sshUser@$hostNatIp `"mkdir -p ~/parcsnet_run/bin ~/parcsnet_run/tests ~/parcsnet_run/out`""
+cmd /c $mkdirCmd 2>&1 | Out-Null
+
+# Upload files
+Write-Host "Uploading runner binaries (~80MB)..."
+$scpCmd = "scp.exe $sshOpts -r `"$publishDir\*`" `"$sshUser@$hostNatIp`:~/parcsnet_run/bin/`""
+cmd /c $scpCmd 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "SCP (runner upload) failed." }
+
+Write-Host "Uploading test inputs..."
+$scpCmd = "scp.exe $sshOpts -r `".\tests\*`" `"$sshUser@$hostNatIp`:~/parcsnet_run/tests/`""
+cmd /c $scpCmd 2>&1 | Out-Null
+
+Write-Host "Uploading Dockerfile..."
+$scpCmd = "scp.exe $sshOpts `".\gcp\parcsnet_runner.Dockerfile`" `"$sshUser@$hostNatIp`:~/parcsnet_run/Dockerfile`""
+cmd /c $scpCmd 2>&1 | Out-Null
+
+Write-Host "Building Docker image on VM (this may take a minute)..."
+$buildCmd = "ssh.exe $sshOpts -T -n $sshUser@$hostNatIp `"docker build -t parcsnet-maps-runner:latest ~/parcsnet_run`""
+cmd /c $buildCmd 2>&1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) { throw "Docker build failed." }
+
 Write-Host ""
-Write-Host "IMPORTANT:"
-Write-Host "  - PARCS.NET client connects directly to daemons on port 2222."
-Write-Host "  - If you want to run your module from your laptop, you must use -AllowExternalClient and set -ClientCidr,"
-Write-Host "    AND make daemons advertise external IPs (EXTERNAL_LOCAL_IP_ADDRESS). Runner-in-VPC is simpler."
+Write-Host "============================================="
+Write-Host "Cluster is ready!"
+Write-Host "============================================="
+Write-Host "HostServer: $hostName ($hostNatIp)"
+Write-Host "Daemons: $Daemons"
+Write-Host "Runner image: parcsnet-maps-runner:latest (built)"
+Write-Host ""
+Write-Host "Run experiments with:"
+Write-Host "  .\gcp\run_experiments_gcp.ps1 -HostInstance `"$hostName`" -Zone `"$Zone`" -Points @(1,$Daemons) -Inputs @(`"tests\medium_district.txt`")"
 

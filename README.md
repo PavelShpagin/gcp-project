@@ -19,7 +19,7 @@ This project demonstrates parallel computing for downloading and stitching Googl
 - Google Maps API key with Static Maps API enabled
 - GCP project with billing enabled
 
-### 1. Set up environment
+### Environment Setup
 
 ```powershell
 # Set your API key
@@ -31,43 +31,37 @@ gcloud services enable compute.googleapis.com
 
 ---
 
-## Configuration 1: Baseline (1 region, 1 point)
+## Configuration 1: Baseline (1 daemon, 1 point)
 
 Single worker baseline for comparison. Expected download time: ~65s.
 
 ```powershell
-# 1. Create cluster (1 host + 1 daemon)
+# 1. Create cluster (builds Docker image automatically)
 .\gcp\parcsnet_cluster.ps1 -Action up -ClusterName "parcsnet-baseline" -Daemons 1 -Zone "us-central1-a"
 
-# 2. Run experiment
+# 2. Run experiment (fast - just runs, no building)
 .\gcp\run_experiments_gcp.ps1 -HostInstance "parcsnet-baseline-host" -Zone "us-central1-a" -Points @(1) -Inputs @("tests\medium_district.txt")
 
 # 3. Cleanup
 .\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-baseline" -Zone "us-central1-a"
 ```
 
-**Results:** `csharp\results_gcp_<timestamp>\`
-- `results.csv` - timing data
-- `medium_district_1.jpg` - stitched satellite map
-
 ---
 
-## Configuration 2: Single Cluster (1 region, multiple points)
+## Configuration 2: Single Cluster (3 daemons, multiple points)
 
 Single region with multiple daemons. Limited by API rate-limiting (~2.3x speedup max).
 
 ```powershell
-# 1. Create cluster (1 host + 3 daemons with independent external IPs)
+# 1. Create cluster with 3 daemons
 .\gcp\parcsnet_cluster.ps1 -Action up -ClusterName "parcsnet-cluster" -Daemons 3 -Zone "us-central1-a"
 
-# 2. Run experiment with 1 and 3 points
+# 2. Run experiments with 1 and 3 points (compare speedup)
 .\gcp\run_experiments_gcp.ps1 -HostInstance "parcsnet-cluster-host" -Zone "us-central1-a" -Points @(1,3) -Inputs @("tests\medium_district.txt")
 
 # 3. Cleanup
 .\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-cluster" -Zone "us-central1-a"
 ```
-
-**Results:** `csharp\results_gcp_<timestamp>\`
 
 ---
 
@@ -76,10 +70,10 @@ Single region with multiple daemons. Limited by API rate-limiting (~2.3x speedup
 Distributes work across 3 GCP regions with independent external IPs per daemon.
 
 ```powershell
-# 1. Create 3 clusters (us-east1, us-west1, europe-west1)
+# 1. Create 3 regional clusters
 .\gcp\run_multi_region_experiments.ps1
 
-# 2. Run federated experiment (splits 144 tiles across regions)
+# 2. Run federated experiment (splits tiles across regions)
 .\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt
 
 # 3. Cleanup all clusters
@@ -88,40 +82,29 @@ Distributes work across 3 GCP regions with independent external IPs per daemon.
 .\gcp\parcsnet_cluster.ps1 -Action down -ClusterName "parcsnet-mr-europe-west1" -Zone "europe-west1-b"
 ```
 
-**Results:** `csharp\federated_results\federated_split_<timestamp>\`
-
 ---
 
 ## Performance Results
 
 | Configuration | Download Time | Speedup |
 |--------------|---------------|---------|
-| 1 region, 1 point (baseline) | 65.0s | 1.0x |
-| 1 region, 3 points (3 IPs) | 28.0s | 2.3x |
-| **3 regions, 9 points (federated)** | **12.5s** | **5.2x** |
+| 1 daemon, 1 point (baseline) | 65.0s | 1.0x |
+| 3 daemons, 3 points (1 region) | 28.0s | 2.3x |
+| **9 daemons, 9 points (3 regions, federated)** | **12.5s** | **5.2x** |
 
-The key insight: Google Maps API rate-limits per external IP. Multi-region deployment with independent IPs per daemon enables true parallel scaling.
+**Key insight:** Google Maps API rate-limits per external IP. Multi-region deployment with independent IPs enables true parallel scaling.
 
 ---
 
 ## Script Architecture
 
-### Infrastructure Scripts (create/destroy VMs)
-
-| Script | Purpose |
-|--------|---------|
-| `parcsnet_cluster.ps1 -Action up` | Create cluster with PARCS.NET containers |
-| `parcsnet_cluster.ps1 -Action down` | Delete cluster and stop billing |
-| `run_multi_region_experiments.ps1` | Create 3 regional clusters + run experiments |
-
-### Experiment Scripts (run on existing clusters)
-
-| Script | Purpose |
-|--------|---------|
-| `run_experiments_gcp.ps1` | Run experiments on a single cluster |
-| `run_federated_split.ps1` | Run federated experiment across regions |
-
-**Note:** Experiment scripts auto-detect if code/images are already deployed and skip redundant uploads. Use `-ForceRebuild` after changing C# code.
+| Script | Purpose | What it does |
+|--------|---------|--------------|
+| `parcsnet_cluster.ps1 -Action up` | **Setup** | Creates VMs, builds Docker image, deploys code |
+| `parcsnet_cluster.ps1 -Action down` | **Cleanup** | Deletes VMs, stops billing |
+| `run_experiments_gcp.ps1` | **Run** | Runs experiments (fast, no building) |
+| `run_multi_region_experiments.ps1` | **Setup + Run** | Creates 3 regional clusters + runs experiments |
+| `run_federated_split.ps1` | **Run** | Runs federated experiment across existing clusters |
 
 ---
 
@@ -131,10 +114,10 @@ The key insight: Google Maps API rate-limits per external IP. Multi-region deplo
 |-----------------|-------------------|
 | Single-region | `csharp\results_gcp_<timestamp>\` |
 | Multi-region | `csharp\results_multi_region_<timestamp>\` |
-| Federated split | `csharp\federated_results\federated_split_<timestamp>\` |
+| Federated | `csharp\federated_results\federated_split_<timestamp>\` |
 
 Each results folder contains:
-- `results.csv` - Timing data (input, points, download time, total time)
+- `results.csv` - Timing data
 - `*.jpg` - Stitched satellite map images (auto-decoded)
 - `log_*.txt` - Raw experiment logs
 
@@ -145,17 +128,17 @@ Each results folder contains:
 ```
 gcp-project/
 ├── gcp/                          # GCP automation scripts
-│   ├── parcsnet_cluster.ps1      # Create/delete single cluster
-│   ├── run_experiments_gcp.ps1   # Run experiments on existing cluster
-│   ├── run_multi_region_experiments.ps1  # Multi-region orchestration
-│   └── run_federated_split.ps1   # Federated tile-splitting experiment
+│   ├── parcsnet_cluster.ps1      # Create/delete cluster + build Docker
+│   ├── run_experiments_gcp.ps1   # Run experiments (fast)
+│   ├── run_multi_region_experiments.ps1  # Multi-region setup
+│   └── run_federated_split.ps1   # Federated tile-splitting
 ├── csharp/                       # PARCS.NET implementation
 │   └── ParcsNetMapsStitcher/     # C# module source code
 ├── tests/                        # Benchmark input files
 │   ├── small_city_block.txt      # 16 tiles (400m x 400m)
 │   └── medium_district.txt       # 144 tiles (1200m x 1200m)
-├── report_c#.tex                 # LaTeX report (PARCS.NET results)
-├── report_c#.pdf                 # Compiled report with 5.2x speedup
+├── report_c#.tex                 # LaTeX report
+├── report_c#.pdf                 # Compiled report (5.2x speedup)
 └── solver.py                     # Python PARCS solver (original)
 ```
 
@@ -176,15 +159,6 @@ Example (`tests/medium_district.txt`):
 1200
 1200
 0
-```
-
-## Python PARCS (Original)
-
-The original Python implementation using Pyro4-based PARCS:
-
-```bash
-pip install -r requirements.txt
-python solver.py
 ```
 
 ## References
