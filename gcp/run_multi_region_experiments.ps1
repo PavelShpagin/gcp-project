@@ -76,13 +76,31 @@ function Get-MachineTypeCpus([string]$machineType, [string]$zone, [string]$proje
   return [int]$cpus.Trim()
 }
 
-if (-not $AggregateOnly) {
-  Write-Host "Publishing runner once..."
-  dotnet publish .\csharp\ParcsNetMapsStitcher\ParcsNetMapsStitcher.csproj -c Release -f netcoreapp2.1 -r linux-x64 --self-contained true
-  if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit code $LASTEXITCODE)." }
+$publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
 
-  # IMPORTANT: keep this as a relative path (Windows absolute paths include ':' which breaks scp syntax).
-  $publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
+if (-not $AggregateOnly) {
+  # Check if we need to publish (source changed since last build)
+  $needsPublish = $false
+  $exePath = Join-Path $publishDir "ParcsNetMapsStitcher"
+  if (-not (Test-Path $publishDir) -or -not (Test-Path $exePath)) {
+    $needsPublish = $true
+  } else {
+    $srcFiles = Get-ChildItem -Path "csharp\ParcsNetMapsStitcher" -Recurse -Include "*.cs","*.csproj" -ErrorAction SilentlyContinue
+    $exeTime = (Get-Item $exePath).LastWriteTime
+    $newerSrc = $srcFiles | Where-Object { $_.LastWriteTime -gt $exeTime }
+    if ($newerSrc.Count -gt 0) {
+      $needsPublish = $true
+    }
+  }
+
+  if ($needsPublish) {
+    Write-Host "Publishing runner (source changed)..."
+    dotnet publish .\csharp\ParcsNetMapsStitcher\ParcsNetMapsStitcher.csproj -c Release -f netcoreapp2.1 -r linux-x64 --self-contained true
+    if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit code $LASTEXITCODE)." }
+  } else {
+    Write-Host "Skipping publish (no source changes detected)."
+  }
+
   if (-not (Test-Path $publishDir)) {
     throw "Publish output not found: $publishDir"
   }

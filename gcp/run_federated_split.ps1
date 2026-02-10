@@ -79,30 +79,41 @@ Write-Host "Output: $outDir"
 $publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
 $sshKey = "C:\Users\Pavel\.ssh\google_compute_engine"
 $inputName = [System.IO.Path]::GetFileName($InputFile)
+$sshOpts = "-i `"$sshKey`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=60"
 
+# Check if Docker image exists on first host (assume all hosts are in sync)
+$firstHost = $hosts[0]
 Write-Host ""
-Write-Host "Rebuilding Docker image on each host..."
+Write-Host "Checking if runner image exists on $($firstHost.name)..."
+$checkCmd = "ssh.exe $sshOpts Pavel@$($firstHost.ip) `"docker images -q parcsnet-maps-runner:latest 2>/dev/null`""
+$checkOut = cmd /c $checkCmd 2>&1
+$imageExists = ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($checkOut -join "").Trim()))
 
-foreach ($h in $hosts) {
-  $region = ($h.name -replace "parcsnet-mr-", "" -replace "-host", "")
-  Write-Host "  Building on $region ($($h.ip))..."
+if ($imageExists) {
+  Write-Host "  Runner image already exists. Skipping upload/build."
+  Write-Host "  (Use run_experiments_gcp.ps1 -ForceRebuild first if you changed code)"
+} else {
+  Write-Host "Uploading and building Docker image on each host..."
   
-  $sshOpts = "-i `"$sshKey`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=60"
-  
-  # Upload new publish folder to bin/ (Dockerfile expects ./bin/)
-  Write-Host "    Uploading..."
-  $scpCmd = "scp.exe $sshOpts -r `"$publishDir\*`" `"Pavel@$($h.ip):/home/Pavel/parcsnet_run/bin/`""
-  $scpOut = cmd /c $scpCmd 2>&1
-  
-  # Rebuild Docker image (with --no-cache to force fresh build)
-  $buildCmd = "cd /home/Pavel/parcsnet_run && docker build --no-cache -t parcsnet-maps-runner:latest -f Dockerfile ."
-  $sshCmd = "ssh.exe $sshOpts Pavel@$($h.ip) `"$buildCmd`""
-  Write-Host "    Building Docker (no-cache)..."
-  $buildOut = cmd /c $sshCmd 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host "    Build output: $($buildOut | Select-Object -Last 5)"
-  } else {
-    Write-Host "    Done."
+  foreach ($h in $hosts) {
+    $region = ($h.name -replace "parcsnet-mr-", "" -replace "-host", "")
+    Write-Host "  Building on $region ($($h.ip))..."
+    
+    # Upload new publish folder to bin/ (Dockerfile expects ./bin/)
+    Write-Host "    Uploading..."
+    $scpCmd = "scp.exe $sshOpts -r `"$publishDir\*`" `"Pavel@$($h.ip):/home/Pavel/parcsnet_run/bin/`""
+    $scpOut = cmd /c $scpCmd 2>&1
+    
+    # Build Docker image
+    $buildCmd = "cd /home/Pavel/parcsnet_run && docker build -t parcsnet-maps-runner:latest -f Dockerfile ."
+    $sshCmd = "ssh.exe $sshOpts Pavel@$($h.ip) `"$buildCmd`""
+    Write-Host "    Building Docker..."
+    $buildOut = cmd /c $sshCmd 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "    Build output: $($buildOut | Select-Object -Last 5)"
+    } else {
+      Write-Host "    Done."
+    }
   }
 }
 
