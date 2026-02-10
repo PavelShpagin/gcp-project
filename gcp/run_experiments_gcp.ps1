@@ -180,9 +180,13 @@ $imageExists = $false
 if (-not $ForceRebuild) {
   Write-Host "Checking if runner image exists on $hostNatIp..."
   $checkResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "docker images -q parcsnet-maps-runner:latest 2>/dev/null" }
-  if ($checkResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace(($checkResult.Output -join "").Trim())) {
+  $imageId = ($checkResult.Output -join "").Trim()
+  # Image ID should be a hex string (12+ chars) if image exists
+  if ($checkResult.ExitCode -eq 0 -and $imageId -match "^[a-f0-9]{12}") {
     $imageExists = $true
-    Write-Host "  Runner image already exists. Use -ForceRebuild to rebuild after code changes."
+    Write-Host "  Runner image already exists (ID: $imageId). Use -ForceRebuild to rebuild."
+  } else {
+    Write-Host "  Runner image not found. Will upload and build."
   }
 }
 

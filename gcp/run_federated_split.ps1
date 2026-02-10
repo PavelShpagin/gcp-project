@@ -87,12 +87,15 @@ Write-Host ""
 Write-Host "Checking if runner image exists on $($firstHost.name)..."
 $checkCmd = "ssh.exe $sshOpts Pavel@$($firstHost.ip) `"docker images -q parcsnet-maps-runner:latest 2>/dev/null`""
 $checkOut = cmd /c $checkCmd 2>&1
-$imageExists = ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($checkOut -join "").Trim()))
+$imageId = ($checkOut -join "").Trim()
+# Image ID should be a hex string (12+ chars) if image exists
+$imageExists = ($LASTEXITCODE -eq 0 -and $imageId -match "^[a-f0-9]{12}")
 
 if ($imageExists) {
-  Write-Host "  Runner image already exists. Skipping upload/build."
+  Write-Host "  Runner image already exists (ID: $imageId). Skipping upload/build."
   Write-Host "  (Use run_experiments_gcp.ps1 -ForceRebuild first if you changed code)"
 } else {
+  Write-Host "  Runner image not found. Will upload and build."
   Write-Host "Uploading and building Docker image on each host..."
   
   foreach ($h in $hosts) {
