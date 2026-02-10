@@ -267,10 +267,38 @@ $rows | Export-Csv -NoTypeInformation -Path $csvPath
 Write-Host ""
 Write-Host "Saved results to: $csvPath"
 
-if ($DownloadOutputs) {
-  Write-Host "Downloading remote outputs (can be large)..."
-  $scpResult = Invoke-Native { & $scp @scpArgs -r "$SshUser@$hostNatIp`:~/parcsnet_run/out/*" $outDir }
-  $scpResult.Output | ForEach-Object { Write-Host $_ }
-  if ($scpResult.ExitCode -ne 0) { throw "SCP (download outputs) failed (exit code $($scpResult.ExitCode))." }
+# Always download and decode outputs
+Write-Host "Downloading remote outputs..."
+$scpResult = Invoke-Native { & $scp @scpArgs -r "$SshUser@$hostNatIp`:~/parcsnet_run/out/*" $outDir }
+$scpResult.Output | ForEach-Object { Write-Host $_ }
+if ($scpResult.ExitCode -ne 0) { 
+  Write-Host "WARNING: SCP (download outputs) failed (exit code $($scpResult.ExitCode)). Skipping decode."
+} else {
+  # Decode all downloaded .txt outputs to images
+  $scriptRoot = Split-Path -Parent $PSScriptRoot
+  $decodeScript = Join-Path $scriptRoot "decode_output.py"
+  
+  if (Test-Path $decodeScript) {
+    $outputFiles = Get-ChildItem -Path $outDir -Filter "out_*.txt" -ErrorAction SilentlyContinue
+    foreach ($outFile in $outputFiles) {
+      $baseName = [IO.Path]::GetFileNameWithoutExtension($outFile.Name) -replace "^out_", ""
+      $imgFile = Join-Path $outDir "$baseName.jpg"
+      
+      Write-Host "Decoding $($outFile.Name) -> $baseName.jpg..."
+      $decodeResult = Invoke-Native { python $decodeScript $outFile.FullName $imgFile }
+      $decodeResult.Output | ForEach-Object { Write-Host $_ }
+      
+      if ($decodeResult.ExitCode -eq 0 -and (Test-Path $imgFile)) {
+        Write-Host "  Saved: $imgFile"
+        # Remove the large .txt file after successful decode
+        Remove-Item $outFile.FullName -Force -ErrorAction SilentlyContinue
+      }
+    }
+  } else {
+    Write-Host "WARNING: decode_output.py not found at $decodeScript - skipping auto-decode"
+  }
 }
+
+Write-Host ""
+Write-Host "Results and images saved to: $outDir"
 
