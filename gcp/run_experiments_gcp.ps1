@@ -115,11 +115,14 @@ $scpArgs = @("-B") + $sshArgsCommon
 # Verify Docker image exists
 Write-Host "Verifying runner image exists..."
 $checkResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "docker images -q parcsnet-maps-runner:latest 2>/dev/null" }
-$imageId = ($checkResult.Output -join "").Trim()
-if (-not ($imageId -match "^[a-f0-9]{12}")) {
+$checkOutput = ($checkResult.Output -join " ")
+# Extract Docker image ID (12 hex chars) from output (may contain SSH warnings)
+if ($checkOutput -match "([a-f0-9]{12})") {
+  $imageId = $Matches[1]
+  Write-Host "  Runner image OK (ID: $imageId)"
+} else {
   throw "Runner image not found on host. Run parcsnet_cluster.ps1 -Action up first to build it."
 }
-Write-Host "  Runner image OK (ID: $imageId)"
 
 $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
 $regionTag = $RegionLabel
