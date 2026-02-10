@@ -26,12 +26,16 @@ param(
 
   # Outputs
   [string]$LocalOutRoot = "csharp",
-  [switch]$DownloadOutputs,
 
-  # Runner image
+  # Build/upload control
+  # -SkipDockerBuild: don't rebuild Docker image (use if image exists and code unchanged)
   [switch]$SkipDockerBuild,
-  # Publish control (useful for multi-region parallel runs)
+  # -SkipPublish: don't run dotnet publish (use if already published)
   [switch]$SkipPublish,
+  # -SkipUpload: don't upload binaries (use if already uploaded, implies -SkipDockerBuild)
+  [switch]$SkipUpload,
+  # -ForceRebuild: force rebuild even if image exists (use after code changes)
+  [switch]$ForceRebuild,
   # Must be a relative path (Windows drive letters break scp syntax)
   [string]$PublishDir
 )
@@ -111,22 +115,45 @@ if ([string]::IsNullOrWhiteSpace($hostInternalIp)) {
   throw "Could not resolve internal IP for host instance '$HostInstance'."
 }
 
-if (-not $SkipPublish) {
+# IMPORTANT: keep this as a relative path (Windows absolute paths include ':' which breaks scp syntax).
+$defaultPublishDir = ".\\csharp\\ParcsNetMapsStitcher\\bin\\Release\\netcoreapp2.1\\linux-x64\\publish"
+$publishDir = if (-not [string]::IsNullOrWhiteSpace($PublishDir)) { $PublishDir } else { $defaultPublishDir }
+
+if ($publishDir -match "^[A-Za-z]:") {
+  throw "PublishDir must be a relative path (got: $publishDir)."
+}
+
+$needsPublish = $false
+if ($ForceRebuild) {
+  $needsPublish = $true
+} elseif ($SkipPublish) {
+  $needsPublish = $false
+} elseif (-not (Test-Path $publishDir)) {
+  $needsPublish = $true
+} else {
+  # Check if source is newer than published output
+  $exePath = Join-Path $publishDir "ParcsNetMapsStitcher"
+  if (Test-Path $exePath) {
+    $srcFiles = Get-ChildItem -Path "csharp\\ParcsNetMapsStitcher" -Recurse -Include "*.cs","*.csproj" -ErrorAction SilentlyContinue
+    $exeTime = (Get-Item $exePath).LastWriteTime
+    $newerSrc = $srcFiles | Where-Object { $_.LastWriteTime -gt $exeTime }
+    if ($newerSrc.Count -gt 0) {
+      Write-Host "Source files changed since last build."
+      $needsPublish = $true
+    }
+  } else {
+    $needsPublish = $true
+  }
+}
+
+if ($needsPublish) {
   Write-Host "Publishing runner (linux-x64, self-contained)..."
   dotnet publish .\csharp\ParcsNetMapsStitcher\ParcsNetMapsStitcher.csproj -c Release -f netcoreapp2.1 -r linux-x64 --self-contained true
   Assert-LastExit "dotnet publish"
 } else {
-  Write-Host "Skipping publish (using existing output)."
+  Write-Host "Skipping publish (no source changes detected). Use -ForceRebuild to force."
 }
 
-# IMPORTANT: keep this as a relative path (Windows absolute paths include ':' which breaks scp syntax).
-$publishDir = ".\\csharp\\ParcsNetMapsStitcher\\bin\\Release\\netcoreapp2.1\\linux-x64\\publish"
-if (-not [string]::IsNullOrWhiteSpace($PublishDir)) {
-  if ($PublishDir -match "^[A-Za-z]:") {
-    throw "PublishDir must be a relative path (got: $PublishDir)."
-  }
-  $publishDir = $PublishDir
-}
 if (-not (Test-Path $publishDir)) {
   throw "Publish output not found: $publishDir"
 }
@@ -148,33 +175,51 @@ $sshArgs = @("-T", "-n") + $sshArgsCommon
 # scp: batch mode (no prompts) + same ssh options.
 $scpArgs = @("-B") + $sshArgsCommon
 
-Write-Host "Preparing remote workspace on $hostNatIp..."
-$sshResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "mkdir -p ~/parcsnet_run/bin ~/parcsnet_run/tests ~/parcsnet_run/out" }
-$sshResult.Output | ForEach-Object { Write-Host $_ }
-if ($sshResult.ExitCode -ne 0) { throw "SSH (mkdir) failed (exit code $($sshResult.ExitCode))." }
+# Check if Docker image already exists on remote (skip upload/build if so)
+$imageExists = $false
+if (-not $ForceRebuild) {
+  Write-Host "Checking if runner image exists on $hostNatIp..."
+  $checkResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "docker images -q parcsnet-maps-runner:latest 2>/dev/null" }
+  if ($checkResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace(($checkResult.Output -join "").Trim())) {
+    $imageExists = $true
+    Write-Host "  Runner image already exists. Use -ForceRebuild to rebuild after code changes."
+  }
+}
 
-Write-Host "Uploading published runner (~80MB)..."
-$scpResult = Invoke-Native { & $scp @scpArgs -r "$publishDir\\*" "$SshUser@$hostNatIp`:~/parcsnet_run/bin/" }
-$scpResult.Output | ForEach-Object { Write-Host $_ }
-if ($scpResult.ExitCode -ne 0) { throw "SCP (runner upload) failed (exit code $($scpResult.ExitCode))." }
+if ($SkipUpload) {
+  Write-Host "Skipping upload (-SkipUpload specified)."
+  $SkipDockerBuild = $true
+} elseif ($imageExists -and -not $ForceRebuild) {
+  Write-Host "Skipping upload (image exists, no -ForceRebuild)."
+} else {
+  Write-Host "Preparing remote workspace on $hostNatIp..."
+  $sshResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "mkdir -p ~/parcsnet_run/bin ~/parcsnet_run/tests ~/parcsnet_run/out" }
+  $sshResult.Output | ForEach-Object { Write-Host $_ }
+  if ($sshResult.ExitCode -ne 0) { throw "SSH (mkdir) failed (exit code $($sshResult.ExitCode))." }
 
-Write-Host "Uploading inputs..."
-$scpResult = Invoke-Native { & $scp @scpArgs -r ".\\tests\\*" "$SshUser@$hostNatIp`:~/parcsnet_run/tests/" }
-$scpResult.Output | ForEach-Object { Write-Host $_ }
-if ($scpResult.ExitCode -ne 0) { throw "SCP (inputs upload) failed (exit code $($scpResult.ExitCode))." }
+  Write-Host "Uploading published runner (~80MB)..."
+  $scpResult = Invoke-Native { & $scp @scpArgs -r "$publishDir\\*" "$SshUser@$hostNatIp`:~/parcsnet_run/bin/" }
+  $scpResult.Output | ForEach-Object { Write-Host $_ }
+  if ($scpResult.ExitCode -ne 0) { throw "SCP (runner upload) failed (exit code $($scpResult.ExitCode))." }
 
-Write-Host "Uploading runner Dockerfile..."
-$scpResult = Invoke-Native { & $scp @scpArgs ".\\gcp\\parcsnet_runner.Dockerfile" "$SshUser@$hostNatIp`:~/parcsnet_run/Dockerfile" }
-$scpResult.Output | ForEach-Object { Write-Host $_ }
-if ($scpResult.ExitCode -ne 0) { throw "SCP (Dockerfile upload) failed (exit code $($scpResult.ExitCode))." }
+  Write-Host "Uploading inputs..."
+  $scpResult = Invoke-Native { & $scp @scpArgs -r ".\\tests\\*" "$SshUser@$hostNatIp`:~/parcsnet_run/tests/" }
+  $scpResult.Output | ForEach-Object { Write-Host $_ }
+  if ($scpResult.ExitCode -ne 0) { throw "SCP (inputs upload) failed (exit code $($scpResult.ExitCode))." }
 
-if (-not $SkipDockerBuild) {
+  Write-Host "Uploading runner Dockerfile..."
+  $scpResult = Invoke-Native { & $scp @scpArgs ".\\gcp\\parcsnet_runner.Dockerfile" "$SshUser@$hostNatIp`:~/parcsnet_run/Dockerfile" }
+  $scpResult.Output | ForEach-Object { Write-Host $_ }
+  if ($scpResult.ExitCode -ne 0) { throw "SCP (Dockerfile upload) failed (exit code $($scpResult.ExitCode))." }
+}
+
+if ($SkipDockerBuild -or ($imageExists -and -not $ForceRebuild)) {
+  Write-Host "Skipping runner image build (using existing image)."
+} else {
   Write-Host "Building runner image on VM..."
   $sshResult = Invoke-Native { & $ssh @sshArgs "$SshUser@$hostNatIp" "docker build -t parcsnet-maps-runner:latest ~/parcsnet_run" }
   $sshResult.Output | ForEach-Object { Write-Host $_ }
   if ($sshResult.ExitCode -ne 0) { throw "SSH (docker build) failed (exit code $($sshResult.ExitCode))." }
-} else {
-  Write-Host "Skipping runner image build (using existing image)..."
 }
 
 $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
