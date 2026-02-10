@@ -7,7 +7,10 @@ param(
   [string]$ProjectId = "maps-demo-486815",
   [string]$InputFile = "tests\medium_district.txt",
   [string]$OutputDir = "csharp\federated_results",
-  [int]$PointsPerRegion = 3
+  [int]$PointsPerRegion = 1,
+  [switch]$ForceRebuild,
+  [int]$Concurrency = 16,
+  [int]$MaxRegions = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -32,7 +35,13 @@ foreach ($line in ($instances -split "`n")) {
   }
 }
 
-Write-Host "Found $($hosts.Count) regional clusters"
+$totalFound = $hosts.Count
+if ($MaxRegions -gt 0 -and $totalFound -gt $MaxRegions) {
+  $hosts = $hosts[0..($MaxRegions - 1)]
+  Write-Host "Using $MaxRegions of $totalFound regional clusters (-Regions limit)"
+} else {
+  Write-Host "Found $totalFound regional clusters"
+}
 
 # Calculate total tiles
 $inputLines = Get-Content $InputFile | Where-Object { $_.Trim() -ne "" }
@@ -79,7 +88,7 @@ Write-Host "Output: $outDir"
 $publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
 $sshKey = "C:\Users\Pavel\.ssh\google_compute_engine"
 $inputName = [System.IO.Path]::GetFileName($InputFile)
-$sshOpts = "-i `"$sshKey`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=60"
+$sshOpts = "-i `"$sshKey`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=60 -o LogLevel=ERROR"
 
 # Check if Docker image exists on first host (assume all hosts are in sync)
 $firstHost = $hosts[0]
@@ -95,11 +104,15 @@ if ($checkOutput -match "([a-f0-9]{12})") {
   $imageExists = $true
 }
 
-if ($imageExists) {
+if ($imageExists -and -not $ForceRebuild) {
   Write-Host "  Runner image already exists (ID: $imageId). Skipping upload/build."
-  Write-Host "  (Use run_experiments_gcp.ps1 -ForceRebuild first if you changed code)"
+  Write-Host "  (Use -ForceRebuild to update code)"
 } else {
-  Write-Host "  Runner image not found. Will upload and build."
+  if ($ForceRebuild) {
+    Write-Host "  ForceRebuild requested. Rebuilding..."
+  } else {
+    Write-Host "  Runner image not found. Will upload and build."
+  }
   Write-Host "Uploading and building Docker image on each host..."
   
   foreach ($h in $hosts) {
@@ -142,12 +155,12 @@ foreach ($a in $assignments) {
   
   Write-Host "Launching $region (tiles $($a.start)-$($a.end), host IP: $hostInternalIp)..."
   
-  $job = Start-Job -Name $region -ArgumentList $h.ip, $sshKey, $PointsPerRegion, $logFile, $hostInternalIp, $inputName, $a.start, $a.end -ScriptBlock {
-    param($ip, $key, $points, $logPath, $hostIntIp, $inputFileName, $tileStart, $tileEnd)
+  $job = Start-Job -Name $region -ArgumentList $h.ip, $sshKey, $PointsPerRegion, $Concurrency, $logFile, $hostInternalIp, $inputName, $a.start, $a.end -ScriptBlock {
+    param($ip, $key, $points, $concurrency, $logPath, $hostIntIp, $inputFileName, $tileStart, $tileEnd)
     
-    $sshOpts = "-i `"$key`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=120 -o ServerAliveInterval=30"
+    $sshOpts = "-i `"$key`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=120 -o ServerAliveInterval=30 -o LogLevel=ERROR"
     
-    $dockerCmd = "docker run --rm --network host -v /home/Pavel/parcsnet_run/out:/out parcsnet-maps-runner:latest --serverip $hostIntIp --user parcs-user --input /app/tests/$inputFileName --output /out/tiles.txt --points $points --downloadonly --tilestart $tileStart --tileend $tileEnd"
+    $dockerCmd = "docker run --rm --network host -e PARCS_POINT_START_DELAY_MS=0 -v /home/Pavel/parcsnet_run/out:/out parcsnet-maps-runner:latest --serverip $hostIntIp --user parcs-user --input /app/tests/$inputFileName --output /out/tiles.txt --points $points --downloadonly --tilestart $tileStart --tileend $tileEnd --concurrency $concurrency"
     $sshFullCmd = "ssh.exe $sshOpts Pavel@$ip `"$dockerCmd`""
     
     $sw = [System.Diagnostics.Stopwatch]::StartNew()

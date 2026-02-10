@@ -70,7 +70,7 @@ namespace ParcsNetMapsStitcher
                 var swTotal = Stopwatch.StartNew();
 
                 var swDownload = Stopwatch.StartNew();
-                var downloadedTiles = DownloadTiles(info, tileRequests, _options.PointsNum, _options.DryRun, zoom, tileSizePx, scale, cropBottom, token);
+                var downloadedTiles = DownloadTiles(info, tileRequests, _options.PointsNum, _options.DryRun, zoom, tileSizePx, scale, cropBottom, _options.Concurrency, token);
                 swDownload.Stop();
                 Console.WriteLine($"Download phase: {swDownload.Elapsed.TotalSeconds:F3}s");
 
@@ -132,6 +132,7 @@ namespace ParcsNetMapsStitcher
             int tileSizePx,
             int scale,
             int cropBottom,
+            int concurrency,
             CancellationToken token)
         {
             var jpegQuality = tileRequests.Count >= 50 ? 45 : 60;
@@ -147,7 +148,8 @@ namespace ParcsNetMapsStitcher
                     TileSizePx = tileSizePx,
                     Scale = scale,
                     CropBottom = cropBottom,
-                    DryRun = dryRun
+                    DryRun = dryRun,
+                    Concurrency = concurrency
                 };
 
                 var results = TileDownloader.DownloadTiles(task, token).ToList();
@@ -186,7 +188,8 @@ namespace ParcsNetMapsStitcher
                     TileSizePx = tileSizePx,
                     Scale = scale,
                     CropBottom = cropBottom,
-                    DryRun = dryRun
+                    DryRun = dryRun,
+                    Concurrency = concurrency
                 };
             }
 

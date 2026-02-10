@@ -64,8 +64,25 @@ function Require-Gcloud {
 
 function Invoke-Gcloud {
   param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GcloudArgs)
-  & $script:GcloudCmdPath @GcloudArgs
-  if ($LASTEXITCODE -ne 0) {
+  $output = & $script:GcloudCmdPath @GcloudArgs 2>&1
+  $exitCode = $LASTEXITCODE
+  
+  # Output to console (filter out error objects for display)
+  $output | ForEach-Object {
+    if ($_ -is [System.Management.Automation.ErrorRecord]) {
+      Write-Host $_.Exception.Message
+    } else {
+      Write-Host $_
+    }
+  }
+  
+  if ($exitCode -ne 0) {
+    # Capture error message for exception
+    $errorMsg = ($output | ForEach-Object {
+      if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
+      else { $_ }
+    }) -join "`n"
+    
     # IMPORTANT: avoid leaking secrets (e.g., GMAPS_KEY) in error messages.
     $safe = @()
     for ($i = 0; $i -lt $GcloudArgs.Length; $i++) {
@@ -86,7 +103,7 @@ function Invoke-Gcloud {
       $safe += $a
     }
 
-    throw "gcloud command failed: gcloud $($safe -join ' ')"
+    throw "gcloud command failed: $errorMsg"
   }
 }
 
@@ -349,7 +366,7 @@ if (-not (Test-Path $publishDir)) {
   throw "Publish output not found: $publishDir"
 }
 
-$sshOpts = "-i `"$sshKeyPath`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=30"
+$sshOpts = "-i `"$sshKeyPath`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=30 -o LogLevel=ERROR"
 
 # Wait for VM to be ready for SSH
 Write-Host "Waiting for host VM to be SSH-ready..."
@@ -395,5 +412,5 @@ Write-Host "Daemons: $Daemons"
 Write-Host "Runner image: parcsnet-maps-runner:latest (built)"
 Write-Host ""
 Write-Host "Run experiments with:"
-Write-Host "  .\gcp\run_experiments_gcp.ps1 -HostInstance `"$hostName`" -Zone `"$Zone`" -Points @(1,$Daemons) -Inputs @(`"tests\medium_district.txt`")"
+Write-Host "  .\gcp\run.ps1 -Run -Regions 1 -PointsPerRegion $Daemons -Concurrency 16"
 

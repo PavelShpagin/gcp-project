@@ -3,146 +3,121 @@ param(
 
   # Targets as array of hashtables: @{ region="us-central1"; zone="us-central1-a" }
   [hashtable[]]$Targets = @(
-    @{ region = "us-east1"; zones = @("us-east1-c", "us-east1-b", "us-east1-d") },
     @{ region = "us-west1"; zones = @("us-west1-a", "us-west1-b", "us-west1-c") },
-    @{ region = "europe-west1"; zones = @("europe-west1-b", "europe-west1-c", "europe-west1-d") }
+    @{ region = "europe-west1"; zones = @("europe-west1-b", "europe-west1-c", "europe-west1-d") },
+    @{ region = "us-east1"; zones = @("us-east1-c", "us-east1-b", "us-east1-d") },
+    @{ region = "us-central1"; zones = @("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f") },
+    @{ region = "europe-west4"; zones = @("europe-west4-a", "europe-west4-b", "europe-west4-c") },
+    @{ region = "asia-east1"; zones = @("asia-east1-a", "asia-east1-b", "asia-east1-c") },
+    @{ region = "asia-northeast1"; zones = @("asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c") },
+    @{ region = "southamerica-east1"; zones = @("southamerica-east1-a", "southamerica-east1-b", "southamerica-east1-c") }
   ),
 
-  [int]$DaemonsPerRegion = 3,
-  [int[]]$Points = @(1, 3),
-
+  [int]$DaemonsPerRegion = 1,
+  [int]$TargetClusterCount = 5,
   [string]$MachineTypeHost = "n1-standard-1",
   [string]$MachineTypeDaemon = "n1-standard-1",
-
-  [string[]]$Inputs = @(
-    "tests\small_city_block.txt",
-    "tests\medium_district.txt"
-  ),
-
   [string]$ClusterNamePrefix = "parcsnet-mr",
-
-  [switch]$SkipDockerBuild,
-  [switch]$DownloadOutputs,
-  [switch]$AggregateOnly,
+  
   [switch]$Cleanup
 )
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "Multi-region PARCS.NET run (costs increase with region count)."
+Write-Host "Multi-region PARCS.NET Infrastructure Setup"
+Write-Host "==========================================="
+Write-Host "Daemons per region: $DaemonsPerRegion"
 Write-Host ""
+
+if ($Cleanup) {
+    Write-Host "Running cleanup mode..."
+    foreach ($t in $Targets) {
+        $region = $t.region
+        $clusterName = "$ClusterNamePrefix-$region"
+        
+        # Try to find which zone has the cluster (simple check)
+        $zones = @($t.zones)
+        foreach ($z in $zones) {
+            Write-Host "Checking cleanup for $clusterName in $z..."
+            & "$PSScriptRoot\parcsnet_cluster.ps1" -Action down -ProjectId $ProjectId -Zone $z -ClusterName $clusterName -Daemons $DaemonsPerRegion -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Host "Cleanup done."
+    exit 0
+}
+
+# --- Quota Helper Functions ---
 
 function Get-InUseAddressesQuota([string]$region, [string]$projectId) {
   $json = & gcloud.cmd compute regions describe $region --project $projectId --format=json
-  if ($LASTEXITCODE -ne 0) {
-    throw "gcloud compute regions describe failed for $region."
-  }
-
+  if ($LASTEXITCODE -ne 0) { throw "gcloud compute regions describe failed for $region." }
   $obj = $json | ConvertFrom-Json
   $q = $obj.quotas | Where-Object { $_.metric -eq "IN_USE_ADDRESSES" } | Select-Object -First 1
-  if (-not $q) {
-    throw "IN_USE_ADDRESSES quota not found for region $region."
-  }
-
-  return [pscustomobject]@{
-    limit = [int]$q.limit
-    usage = [int]$q.usage
-  }
+  if (-not $q) { throw "IN_USE_ADDRESSES quota not found for region $region." }
+  return [pscustomobject]@{ limit = [int]$q.limit; usage = [int]$q.usage }
 }
 
 function Get-GlobalCpuQuota([string]$projectId) {
   $json = & gcloud.cmd compute project-info describe --project $projectId --format=json
-  if ($LASTEXITCODE -ne 0) {
-    throw "gcloud compute project-info describe failed."
-  }
-
+  if ($LASTEXITCODE -ne 0) { throw "gcloud compute project-info describe failed." }
   $obj = $json | ConvertFrom-Json
   $q = $obj.quotas | Where-Object { $_.metric -eq "CPUS_ALL_REGIONS" } | Select-Object -First 1
-  if (-not $q) {
-    throw "CPUS_ALL_REGIONS quota not found."
-  }
-
-  return [pscustomobject]@{
-    limit = [int]$q.limit
-    usage = [int]$q.usage
-  }
+  if (-not $q) { throw "CPUS_ALL_REGIONS quota not found." }
+  return [pscustomobject]@{ limit = [int]$q.limit; usage = [int]$q.usage }
 }
 
 function Get-MachineTypeCpus([string]$machineType, [string]$zone, [string]$projectId) {
   $cpus = & gcloud.cmd compute machine-types describe $machineType --zone $zone --project $projectId --format="get(guestCpus)"
-  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cpus)) {
-    throw "Failed to resolve guestCpus for $machineType in $zone."
-  }
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cpus)) { throw "Failed to resolve guestCpus for $machineType in $zone." }
   return [int]$cpus.Trim()
 }
 
-$publishDir = ".\csharp\ParcsNetMapsStitcher\bin\Release\netcoreapp2.1\linux-x64\publish"
+# --- Main Setup Loop ---
 
-if (-not $AggregateOnly) {
-  # Check if we need to publish (source changed since last build)
-  $needsPublish = $false
-  $exePath = Join-Path $publishDir "ParcsNetMapsStitcher"
-  if (-not (Test-Path $publishDir) -or -not (Test-Path $exePath)) {
-    $needsPublish = $true
-  } else {
-    $srcFiles = Get-ChildItem -Path "csharp\ParcsNetMapsStitcher" -Recurse -Include "*.cs","*.csproj" -ErrorAction SilentlyContinue
-    $exeTime = (Get-Item $exePath).LastWriteTime
-    $newerSrc = $srcFiles | Where-Object { $_.LastWriteTime -gt $exeTime }
-    if ($newerSrc.Count -gt 0) {
-      $needsPublish = $true
-    }
-  }
-
-  if ($needsPublish) {
-    Write-Host "Publishing runner (source changed)..."
-    dotnet publish .\csharp\ParcsNetMapsStitcher\ParcsNetMapsStitcher.csproj -c Release -f netcoreapp2.1 -r linux-x64 --self-contained true
-    if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit code $LASTEXITCODE)." }
-  } else {
-    Write-Host "Skipping publish (no source changes detected)."
-  }
-
-  if (-not (Test-Path $publishDir)) {
-    throw "Publish output not found: $publishDir"
-  }
-}
-
-$stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$multiOutDir = Join-Path "csharp" ("results_multi_region_" + $stamp)
-New-Item -ItemType Directory -Force -Path $multiOutDir | Out-Null
-
-$regionResults = @()
 $cpuQuota = Get-GlobalCpuQuota $ProjectId
 $plannedCpuUsage = $cpuQuota.usage
+$activeClusters = @()
 
 foreach ($t in $Targets) {
+  if ($activeClusters.Count -ge $TargetClusterCount) {
+    Write-Host "Reached target cluster count ($TargetClusterCount). Stopping setup."
+    break
+  }
+  
   $region = $t.region
   $zonesToTry = @()
   if ($t.zones) { $zonesToTry = @($t.zones) }
   if ($t.zone) { $zonesToTry = @($t.zone) }
-  if ([string]::IsNullOrWhiteSpace($region) -or $zonesToTry.Count -eq 0) {
-    throw "Each target must include 'region' and at least one zone."
-  }
+  
+  if ([string]::IsNullOrWhiteSpace($region)) { continue }
 
   $clusterName = "$ClusterNamePrefix-$region"
-  $hostInstance = "$clusterName-host"
-
   Write-Host ""
   Write-Host "== Region: $region =="
 
-  if ($AggregateOnly) {
-    $regionDir = Get-ChildItem "csharp" -Directory |
-      Where-Object { $_.Name -like ("results_gcp_*_" + $region) } |
-      Sort-Object LastWriteTime -Descending |
-      Select-Object -First 1
-
-    if ($regionDir) {
-      $regionResults += $regionDir.FullName
-    } else {
-      Write-Host "No existing results for region: $region"
-    }
-    continue
+  # Check if cluster already exists
+  $existingHost = & gcloud.cmd compute instances describe "$clusterName-host" --zone "$($t.zones[0])" --format="get(networkInterfaces[0].accessConfigs[0].natIP)" 2>$null
+  # Try checking other zones if first fails? Or simpler: list instances matching name
+  $checkCmd = "gcloud.cmd compute instances list --filter=`"name~'^$clusterName-host$'`" --format=`"csv[no-heading](name,zone,networkInterfaces[0].accessConfigs[0].natIP)`""
+  $checkOut = Invoke-Expression $checkCmd
+  
+  if (-not [string]::IsNullOrWhiteSpace($checkOut)) {
+      $parts = $checkOut -split ","
+      $foundName = $parts[0]
+      $foundZone = $parts[1]
+      $foundIp = $parts[2]
+      
+      Write-Host "Cluster $clusterName already exists in $foundZone. reusing."
+      $activeClusters += [pscustomobject]@{
+          Region = $region
+          Zone = $foundZone
+          ClusterName = $clusterName
+          HostIP = $foundIp
+      }
+      continue
   }
 
+  # Check IP quota
   $quota = Get-InUseAddressesQuota $region $ProjectId
   $needed = 1 + $DaemonsPerRegion
   if (($quota.usage + $needed) -gt $quota.limit) {
@@ -151,36 +126,48 @@ foreach ($t in $Targets) {
   }
 
   $selectedZone = $null
+  
   foreach ($zone in $zonesToTry) {
+    # Check CPU quota
     $hostCpus = Get-MachineTypeCpus $MachineTypeHost $zone $ProjectId
     $daemonCpus = Get-MachineTypeCpus $MachineTypeDaemon $zone $ProjectId
     $cpuNeeded = $hostCpus + ($daemonCpus * $DaemonsPerRegion)
+    
     if (($plannedCpuUsage + $cpuNeeded) -gt $cpuQuota.limit) {
       Write-Host "Skipping ${region} zone ${zone}: CPUS_ALL_REGIONS $plannedCpuUsage/$($cpuQuota.limit), need $cpuNeeded"
       continue
     }
 
     Write-Host "Bringing up cluster: $clusterName (daemons=$DaemonsPerRegion) in $zone"
-    $clusterCmd = @(
-      "powershell -NoProfile -ExecutionPolicy Bypass -File",
-      "`"$PSScriptRoot\parcsnet_cluster.ps1`"",
-      "-Action", "up",
-      "-ProjectId", $ProjectId,
-      "-Zone", $zone,
-      "-ClusterName", $clusterName,
-      "-Daemons", $DaemonsPerRegion,
-      "-MachineTypeHost", $MachineTypeHost,
-      "-MachineTypeDaemon", $MachineTypeDaemon
-    ) -join " "
-
-    $oldErr = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $clusterOut = cmd /c $clusterCmd 2>&1
-    $ErrorActionPreference = $oldErr
-    $clusterOut | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
-      $msg = ($clusterOut | Out-String)
-      if ($msg -match "does not have enough resources available") {
+    
+    # Run cluster script directly
+    $clusterScript = "$PSScriptRoot\parcsnet_cluster.ps1"
+    $clusterArgs = @{
+      Action = "up"
+      ProjectId = $ProjectId
+      Zone = $zone
+      ClusterName = $clusterName
+      Daemons = $DaemonsPerRegion
+      MachineTypeHost = $MachineTypeHost
+      MachineTypeDaemon = $MachineTypeDaemon
+    }
+    
+    $clusterFailed = $false
+    $capacityError = $false
+    
+    try {
+      & $clusterScript @clusterArgs
+    } catch {
+      $clusterFailed = $true
+      if ($_.Exception.Message -match "does not have enough resources available") {
+        $capacityError = $true
+      } else {
+        Write-Error $_
+      }
+    }
+    
+    if ($clusterFailed) {
+      if ($capacityError) {
         Write-Host "Zone $zone lacks capacity, trying next..."
         continue
       }
@@ -189,115 +176,28 @@ foreach ($t in $Targets) {
 
     $selectedZone = $zone
     $plannedCpuUsage += $cpuNeeded
-    break
+    
+    # Get Host IP for summary
+    $hostIp = & gcloud.cmd compute instances describe "$clusterName-host" --zone $zone --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
+    $activeClusters += [pscustomobject]@{
+        Region = $region
+        Zone = $zone
+        ClusterName = $clusterName
+        HostIP = $hostIp
+    }
+    
+    break # Success, move to next region
   }
 
   if (-not $selectedZone) {
     Write-Host "Skipping ${region}: no zone had capacity."
-    continue
-  }
-
-  $pointsForRegion = @($Points | Where-Object { $_ -le $DaemonsPerRegion })
-  $skippedPoints = @($Points | Where-Object { $_ -gt $DaemonsPerRegion })
-  if ($skippedPoints.Count -gt 0) {
-    Write-Host "Skipping points > ${DaemonsPerRegion}: $($skippedPoints -join ', ')"
-  }
-  if ($pointsForRegion.Count -eq 0) {
-    throw "No points <= $DaemonsPerRegion. Adjust -Points or -DaemonsPerRegion."
-  }
-
-  Write-Host "Running experiments in $region with points: $($pointsForRegion -join ', ')"
-
-  & "$PSScriptRoot\run_experiments_gcp.ps1" `
-    -ProjectId $ProjectId `
-    -Zone $selectedZone `
-    -HostInstance $hostInstance `
-    -Inputs $Inputs `
-    -Points $pointsForRegion `
-    -SkipDockerBuild:$SkipDockerBuild `
-    -SkipPublish `
-    -PublishDir $publishDir `
-    -DownloadOutputs:$DownloadOutputs `
-    -RegionLabel $region
-
-  $regionDir = Get-ChildItem "csharp" -Directory |
-    Where-Object { $_.Name -like ("results_gcp_*_" + $region) } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-
-  if (-not $regionDir) {
-    throw "Could not find results directory for region: $region"
-  }
-
-  $regionResults += $regionDir.FullName
-
-  if ($Cleanup) {
-    Write-Host "Cleaning up cluster: $clusterName"
-    & "$PSScriptRoot\parcsnet_cluster.ps1" `
-      -Action down `
-      -ProjectId $ProjectId `
-      -Zone $zone `
-      -ClusterName $clusterName `
-      -Daemons $DaemonsPerRegion
   }
 }
 
 Write-Host ""
-Write-Host "Aggregating results..."
-
-$allRows = @()
-foreach ($dir in $regionResults) {
-  $csv = Join-Path $dir "results.csv"
-  if (-not (Test-Path $csv)) { throw "Missing results.csv: $csv" }
-
-  $rows = Import-Csv $csv
-  foreach ($r in $rows) {
-    if (-not $r.region) {
-      $r | Add-Member -NotePropertyName region -NotePropertyValue "unknown"
-    }
-    $allRows += $r
-  }
-}
-
-$aggCsv = Join-Path $multiOutDir "results.csv"
-$allRows | Export-Csv -NoTypeInformation -Path $aggCsv
-
-$summary = @()
-$groups = $allRows | Group-Object dataset, points
-foreach ($g in $groups) {
-  $items = $g.Group
-  $avgDownload = ($items | Measure-Object download_s -Average).Average
-  $avgMosaic = ($items | Measure-Object mosaic_s -Average).Average
-  $avgTotal = ($items | Measure-Object total_s -Average).Average
-
-  $dataset = $items[0].dataset
-  $pointValue = [int]$items[0].points
-
-  $summary += [pscustomobject]@{
-    dataset = $dataset
-    points = $pointValue
-    avg_download_s = [math]::Round($avgDownload, 3)
-    avg_mosaic_s = [math]::Round($avgMosaic, 3)
-    avg_total_s = [math]::Round($avgTotal, 3)
-  }
-}
-
-$summary = $summary | Sort-Object dataset, points
-
-foreach ($d in ($summary | Select-Object -ExpandProperty dataset -Unique)) {
-  $base = ($summary | Where-Object { $_.dataset -eq $d -and $_.points -eq 1 })
-  if ($base) {
-    foreach ($row in ($summary | Where-Object { $_.dataset -eq $d })) {
-      $row | Add-Member -NotePropertyName speedup_download -NotePropertyValue ([math]::Round(($base.avg_download_s / $row.avg_download_s), 3))
-      $row | Add-Member -NotePropertyName speedup_total -NotePropertyValue ([math]::Round(($base.avg_total_s / $row.avg_total_s), 3))
-    }
-  }
-}
-
-$summaryCsv = Join-Path $multiOutDir "summary.csv"
-$summary | Export-Csv -NoTypeInformation -Path $summaryCsv
+Write-Host "Setup Complete."
+Write-Host "Active Clusters:"
+$activeClusters | Format-Table -AutoSize
 
 Write-Host ""
-Write-Host "Multi-region results saved:"
-Write-Host "  $aggCsv"
-Write-Host "  $summaryCsv"
+Write-Host "Now run: .\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt"

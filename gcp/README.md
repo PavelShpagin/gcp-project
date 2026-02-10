@@ -57,19 +57,16 @@ Optional flags:
 - `--no-download` (skip downloading large output files)
 - `--teardown` (delete the cluster at the end)
 
-## Run experiments (PowerShell only)
+## Run experiments (PowerShell)
 
-Run everything end-to-end (build → upload → run p=1/4/7 → collect logs → write `results.csv`):
-
-```powershell
-.\gcp\run_experiments_gcp.ps1 -ProjectId maps-demo-486815 -Zone us-central1-a -HostInstance parcsnet-host
-```
-
-Quick “no API calls” sanity check:
+Run federated experiment on existing `parcsnet-mr-*` clusters (MaxRegions=0 uses all):
 
 ```powershell
-.\gcp\run_experiments_gcp.ps1 -ProjectId maps-demo-486815 -Zone us-central1-a -HostInstance parcsnet-host -DryRun
+.\gcp\run.ps1 -MaxRegions 4 -PointsPerRegion 3 -Concurrency 16
 ```
+
+- MaxRegions=0 = use all. -ForceRebuild = rebuild Docker first.
+- Create: run_multi_region_experiments.ps1. Delete: cleanup_regions.ps1.
 
 Notes:
 - By default it saves `csharp\results_gcp_YYYYMMDD_HHMMSS\results.csv` plus per-run logs.

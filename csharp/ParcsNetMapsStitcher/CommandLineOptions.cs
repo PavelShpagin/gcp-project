@@ -25,5 +25,8 @@ namespace ParcsNetMapsStitcher
 
         [Option("tileend", Required = false, Default = -1, HelpText = "End tile index (exclusive, -1 = all) for federated mode.")]
         public int TileEnd { get; set; }
+
+        [Option("concurrency", Required = false, Default = 1, HelpText = "Concurrency level per worker.")]
+        public int Concurrency { get; set; }
     }
 }

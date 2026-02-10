@@ -11,6 +11,7 @@ namespace ParcsNetMapsStitcher.Models
         public int TileSizePx { get; set; } = 640;
         public int Scale { get; set; } = 2;
         public int CropBottom { get; set; } = 40;
+        public int Concurrency { get; set; } = 1;
 
         public bool DryRun { get; set; }
     }

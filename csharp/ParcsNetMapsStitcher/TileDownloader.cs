@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
+using System.Threading.Tasks;
 using ParcsNetMapsStitcher.Models;
 
 namespace ParcsNetMapsStitcher
@@ -16,6 +17,9 @@ namespace ParcsNetMapsStitcher
 
         public static TileResult[] DownloadTiles(TileDownloadTask task, CancellationToken token)
         {
+            // Optimize thread pool for burst parallelism on single-core containers
+            ThreadPool.SetMinThreads(32, 32);
+
             Console.WriteLine($"Worker downloading {task.Requests.Length} tiles...");
 
             var throttleSeconds = GetThrottleSeconds();
@@ -27,18 +31,20 @@ namespace ParcsNetMapsStitcher
                     "No Google Maps API key found. Set GMAPS_KEY or GOOGLE_MAPS_API_KEY in the environment.");
             }
 
-            var results = new List<TileResult>(task.Requests.Length);
-            for (var idx = 0; idx < task.Requests.Length; idx++)
+            var results = new System.Collections.Concurrent.ConcurrentBag<TileResult>();
+            var options = new ParallelOptions
             {
-                token.ThrowIfCancellationRequested();
+                CancellationToken = token,
+                MaxDegreeOfParallelism = task.Concurrency > 0 ? task.Concurrency : 1
+            };
 
-                var req = task.Requests[idx];
+            var count = 0;
+            Parallel.ForEach(task.Requests, options, (req) =>
+            {
                 byte[]? imageBytes = null;
 
                 if (task.DryRun)
                 {
-                    // Dry-run: don't call Google Maps. We return placeholders (no bytes),
-                    // and the master will generate dummy tiles to avoid extra dependencies on workers.
                     imageBytes = null;
                 }
                 else
@@ -56,11 +62,12 @@ namespace ParcsNetMapsStitcher
 
                 results.Add(new TileResult { Row = req.Row, Col = req.Col, ImageBytes = imageBytes });
 
-                if ((idx + 1) % 10 == 0)
+                var current = Interlocked.Increment(ref count);
+                if (current % 10 == 0)
                 {
-                    Console.WriteLine($"Progress: {idx + 1}/{task.Requests.Length}");
+                    Console.WriteLine($"Progress: {current}/{task.Requests.Length}");
                 }
-            }
+            });
 
             var ok = 0;
             foreach (var r in results)
@@ -176,6 +183,16 @@ namespace ParcsNetMapsStitcher
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
             };
+#if !NET48
+            try
+            {
+                handler.MaxConnectionsPerServer = 50;
+            }
+            catch
+            {
+                // Ignore if platform doesn't support it
+            }
+#endif
 
             var client = new HttpClient(handler)
             {

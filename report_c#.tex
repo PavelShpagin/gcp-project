@@ -84,11 +84,11 @@ Initial experiments with a single PARCS.NET cluster revealed that Google Maps AP
 To overcome per-IP rate limits, we deploy clusters across \textbf{multiple GCP regions}, each with independent external IPs. The workload is \textbf{split across regions} (federated), with each region downloading a subset of tiles in parallel:
 
 \begin{verbatim}
-# Deploy 3 clusters (us-east1, us-west1, europe-west1)
-.\gcp\run_multi_region_experiments.ps1
+# Deploy clusters (e.g. 2 regions: us-west1, europe-west1)
+.\gcp\run_multi_region_experiments.ps1 -TargetClusterCount 2 -DaemonsPerRegion 3
 
 # Run federated split experiment
-.\gcp\run_federated_split.ps1 -InputFile tests\medium_district.txt
+.\gcp\run.ps1 -Run -Regions 2 -PointsPerRegion 3 -Concurrency 16
 \end{verbatim}
 
 \begin{table}[h]
@@ -99,14 +99,14 @@ To overcome per-IP rate limits, we deploy clusters across \textbf{multiple GCP r
 \toprule
 Configuration & Download Time & Speedup \\
 \midrule
-1 region, 1 point (baseline) & 65.0s & 1.0$\times$ \\
-1 region, 3 points (3 IPs) & 28.0s & 2.3$\times$ \\
-\textbf{3 regions, 9 points (9 IPs, federated)} & \textbf{12.5s} & \textbf{5.2$\times$} \\
+1 region, 1 point (baseline) & 48.7s & 1.0$\times$ \\
+1 region, 3 points (3 IPs) & 25.0s & 1.9$\times$ \\
+\textbf{2 regions, 6 points (6 IPs, federated)} & \textbf{14.0s} & \textbf{3.5$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The federated architecture splits 144 tiles across 3 regions (48 tiles each). Each region uses 3 daemons with independent external IPs, achieving true parallel downloads without API throttling.
+The federated architecture splits 144 tiles across 2 regions (72 tiles each). Each region uses 3 daemons with independent external IPs, achieving true parallel downloads without API throttling.
 
 \begin{table}[h]
 \centering
@@ -116,14 +116,13 @@ The federated architecture splits 144 tiles across 3 regions (48 tiles each). Ea
 \toprule
 Region & Tiles & Download Time \\
 \midrule
-europe-west1 & 48 & 11.4s \\
-us-west1 & 48 & 11.7s \\
-us-east1 & 48 & 12.5s \\
+europe-west1 & 72 & 13.4s \\
+us-west1 & 72 & 14.0s \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Wall-clock time is determined by the slowest region (12.5s), yielding the \textbf{5.2$\times$ speedup} over the single-point baseline.
+Wall-clock time is determined by the slowest region (14.0s), yielding the \textbf{3.5$\times$ speedup} over the single-point baseline.
 
 \section{Optimizations}
 
@@ -151,7 +150,7 @@ On GCP Container-Optimized OS, user home directories are mounted with \texttt{no
 
 \section{Conclusion}
 
-The PARCS.NET implementation achieves \textbf{5.2$\times$ speedup} on the medium dataset (144 tiles) using a multi-region federated architecture with 9 parallel workers across 3 GCP regions. This demonstrates that the Google Maps tile download problem is highly parallelizable when API rate-limiting is mitigated through independent external IPs.
+The PARCS.NET implementation achieves \textbf{3.5$\times$ speedup} on the medium dataset (144 tiles) using a multi-region federated architecture with 6 parallel workers across 2 GCP regions. This demonstrates that the Google Maps tile download problem is highly parallelizable when API rate-limiting is mitigated through independent external IPs.
 
 The key insight is that single-region deployments hit API throttling limits regardless of worker count, but distributing workers across regions with independent IPs enables true parallel scaling. The provided scripts automate cluster deployment and federated execution.
 
