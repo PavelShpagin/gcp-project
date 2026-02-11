@@ -14,5 +14,11 @@ namespace ParcsNetMapsStitcher.Models
         public int Concurrency { get; set; } = 1;
 
         public bool DryRun { get; set; }
+
+        /// <summary>
+        /// When true, uses parallel downloads with thread pool optimization.
+        /// When false (default), uses sequential downloads for baseline measurement.
+        /// </summary>
+        public bool Optimized { get; set; }
     }
 }

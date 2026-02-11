@@ -17,10 +17,7 @@ namespace ParcsNetMapsStitcher
 
         public static TileResult[] DownloadTiles(TileDownloadTask task, CancellationToken token)
         {
-            // Optimize thread pool for burst parallelism on single-core containers
-            ThreadPool.SetMinThreads(32, 32);
-
-            Console.WriteLine($"Worker downloading {task.Requests.Length} tiles...");
+            Console.WriteLine($"Worker downloading {task.Requests.Length} tiles (optimized={task.Optimized})...");
 
             var throttleSeconds = GetThrottleSeconds();
 
@@ -30,6 +27,80 @@ namespace ParcsNetMapsStitcher
                 throw new InvalidOperationException(
                     "No Google Maps API key found. Set GMAPS_KEY or GOOGLE_MAPS_API_KEY in the environment.");
             }
+
+            TileResult[] results;
+
+            if (task.Optimized && task.Concurrency > 1)
+            {
+                // Parallel mode: use thread pool optimization for maximum throughput
+                results = DownloadTilesParallel(task, apiKey!, throttleSeconds, token);
+            }
+            else
+            {
+                // Sequential mode: true baseline without any parallelism or thread pool tricks
+                results = DownloadTilesSequential(task, apiKey!, throttleSeconds, token);
+            }
+
+            var ok = results.Count(r => r.ImageBytes != null && r.ImageBytes.Length > 0);
+            Console.WriteLine($"Worker completed: {ok} successful downloads");
+            return results;
+        }
+
+        private static TileResult[] DownloadTilesSequential(
+            TileDownloadTask task,
+            string apiKey,
+            double throttleSeconds,
+            CancellationToken token)
+        {
+            var results = new List<TileResult>(task.Requests.Length);
+
+            for (var idx = 0; idx < task.Requests.Length; idx++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var req = task.Requests[idx];
+                byte[]? imageBytes = null;
+
+                if (!task.DryRun)
+                {
+                    // In sequential (baseline) mode, we use a fresh HttpClient for each request
+                    // to simulate a naive implementation without connection pooling.
+                    // This provides a fair "unoptimized" baseline to compare against.
+                    using (var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate })
+                    using (var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) })
+                    {
+                        imageBytes = DownloadSingleTileJpeg(
+                            client,
+                            apiKey,
+                            req.Lat,
+                            req.Lon,
+                            task.Zoom,
+                            task.TileSizePx,
+                            task.Scale,
+                            throttleSeconds,
+                            token);
+                    }
+                }
+
+                results.Add(new TileResult { Row = req.Row, Col = req.Col, ImageBytes = imageBytes });
+
+                if ((idx + 1) % 10 == 0)
+                {
+                    Console.WriteLine($"Progress: {idx + 1}/{task.Requests.Length}");
+                }
+            }
+
+            return results.ToArray();
+        }
+
+        private static TileResult[] DownloadTilesParallel(
+            TileDownloadTask task,
+            string apiKey,
+            double throttleSeconds,
+            CancellationToken token)
+        {
+            // Optimize thread pool for burst parallelism on single-core containers
+            ThreadPool.SetMinThreads(32, 32);
 
             var results = new System.Collections.Concurrent.ConcurrentBag<TileResult>();
             var options = new ParallelOptions
@@ -43,14 +114,11 @@ namespace ParcsNetMapsStitcher
             {
                 byte[]? imageBytes = null;
 
-                if (task.DryRun)
-                {
-                    imageBytes = null;
-                }
-                else
+                if (!task.DryRun)
                 {
                     imageBytes = DownloadSingleTileJpeg(
-                        apiKey!,
+                        Client,
+                        apiKey,
                         req.Lat,
                         req.Lon,
                         task.Zoom,
@@ -69,17 +137,14 @@ namespace ParcsNetMapsStitcher
                 }
             });
 
-            var ok = 0;
-            foreach (var r in results)
-            {
-                if (r.ImageBytes != null && r.ImageBytes.Length > 0) ok++;
-            }
-
-            Console.WriteLine($"Worker completed: {ok} successful downloads");
             return results.ToArray();
         }
 
+        // Random for cache-busting via tiny coordinate jitter (thread-safe)
+        private static readonly ThreadLocal<Random> Rng = new ThreadLocal<Random>(() => new Random(Guid.NewGuid().GetHashCode()));
+
         private static byte[]? DownloadSingleTileJpeg(
+            HttpClient client,
             string apiKey,
             double lat,
             double lon,
@@ -91,12 +156,16 @@ namespace ParcsNetMapsStitcher
         {
             const string baseUrl = "https://maps.googleapis.com/maps/api/staticmap";
 
-            // Keep formatting consistent with Python solver (10 decimal digits).
+            // Add tiny random jitter to coordinates to bust CDN cache (imperceptible at zoom 19)
+            // At zoom 19, 1e-7 degrees ~= 0.01 meters - invisible but unique
+            var jitterLat = (Rng.Value!.NextDouble() - 0.5) * 2e-7;
+            var jitterLon = (Rng.Value!.NextDouble() - 0.5) * 2e-7;
+
             var center = string.Format(
                 CultureInfo.InvariantCulture,
                 "{0:F10},{1:F10}",
-                lat,
-                lon);
+                lat + jitterLat,
+                lon + jitterLon);
 
             var url =
                 $"{baseUrl}?center={Uri.EscapeDataString(center)}" +
@@ -117,7 +186,7 @@ namespace ParcsNetMapsStitcher
                         Thread.Sleep(TimeSpan.FromSeconds(throttleSeconds));
                     }
 
-                    using (var response = Client.GetAsync(url, token).GetAwaiter().GetResult())
+                    using (var response = client.GetAsync(url, token).GetAwaiter().GetResult())
                     {
                         response.EnsureSuccessStatusCode();
 

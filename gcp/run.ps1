@@ -4,18 +4,20 @@ param(
     [switch]$Run,
     [int]$Regions = 1,
     [int]$PointsPerRegion = 1,
-    [int]$Concurrency = 16,
+    [int]$Concurrency = 1,
     [string]$InputFile = "tests\medium_district.txt",
     [string]$ProjectId = "maps-demo-486815",
-    [switch]$ForceRebuild
+    [switch]$ForceRebuild,
+    [switch]$Optimized
 )
 
 $ErrorActionPreference = "Stop"
 
 if (-not ($Cleanup -or $Setup -or $Run)) {
     Write-Host "Usage: .\gcp\run.ps1 [-Cleanup] [-Setup] [-Run] ..."
-    Write-Host "  Clusters already running: .\gcp\run.ps1 -Run -Regions 4 -PointsPerRegion 3 -Concurrency 16"
-    Write-Host "  Full cycle: .\gcp\run.ps1 -Cleanup -Setup -Run -Regions 4 -PointsPerRegion 3 -Concurrency 16"
+    Write-Host "  Baseline (sequential): .\gcp\run.ps1 -Run -Regions 1 -PointsPerRegion 1 -Concurrency 1"
+    Write-Host "  Optimized parallel:    .\gcp\run.ps1 -Run -Regions 3 -PointsPerRegion 3 -Concurrency 16 -Optimized"
+    Write-Host "  Full cycle: .\gcp\run.ps1 -Cleanup -Setup -Run -Regions 4 -PointsPerRegion 3 -Concurrency 16 -Optimized"
     return
 }
 
@@ -44,5 +46,5 @@ if ($Run) {
         if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed." }
     }
 
-    & "$PSScriptRoot\run_federated_split.ps1" -ProjectId $ProjectId -InputFile $InputFile -PointsPerRegion $PointsPerRegion -Concurrency $Concurrency -MaxRegions $Regions -ForceRebuild:$ForceRebuild.IsPresent
+    & "$PSScriptRoot\run_federated_split.ps1" -ProjectId $ProjectId -InputFile $InputFile -PointsPerRegion $PointsPerRegion -Concurrency $Concurrency -MaxRegions $Regions -ForceRebuild:$ForceRebuild.IsPresent -Optimized:$Optimized.IsPresent
 }

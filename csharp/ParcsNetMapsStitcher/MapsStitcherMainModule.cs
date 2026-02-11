@@ -66,11 +66,12 @@ namespace ParcsNetMapsStitcher
                     Console.WriteLine($"Federated mode: tiles [{tileStart}, {tileEnd}) of {allTileRequests.Count}");
                 }
                 Console.WriteLine($"Distributing {tileRequests.Count} tiles across {_options.PointsNum} points");
+                Console.WriteLine($"Execution settings: concurrency={_options.Concurrency}, optimized={_options.Optimized}");
 
                 var swTotal = Stopwatch.StartNew();
 
                 var swDownload = Stopwatch.StartNew();
-                var downloadedTiles = DownloadTiles(info, tileRequests, _options.PointsNum, _options.DryRun, zoom, tileSizePx, scale, cropBottom, _options.Concurrency, token);
+                var downloadedTiles = DownloadTiles(info, tileRequests, _options.PointsNum, _options.DryRun, zoom, tileSizePx, scale, cropBottom, _options.Concurrency, _options.Optimized, token);
                 swDownload.Stop();
                 Console.WriteLine($"Download phase: {swDownload.Elapsed.TotalSeconds:F3}s");
 
@@ -133,6 +134,7 @@ namespace ParcsNetMapsStitcher
             int scale,
             int cropBottom,
             int concurrency,
+            bool optimized,
             CancellationToken token)
         {
             var jpegQuality = tileRequests.Count >= 50 ? 45 : 60;
@@ -149,7 +151,8 @@ namespace ParcsNetMapsStitcher
                     Scale = scale,
                     CropBottom = cropBottom,
                     DryRun = dryRun,
-                    Concurrency = concurrency
+                    Concurrency = concurrency,
+                    Optimized = optimized
                 };
 
                 var results = TileDownloader.DownloadTiles(task, token).ToList();
@@ -181,6 +184,7 @@ namespace ParcsNetMapsStitcher
                 }
 
                 Console.WriteLine($"Point {i}: downloading {assigned.Count} tiles");
+                Console.WriteLine($"Point {i} settings: concurrency={concurrency}, optimized={optimized}");
                 tasks[i] = new TileDownloadTask
                 {
                     Requests = assigned.ToArray(),
@@ -189,7 +193,8 @@ namespace ParcsNetMapsStitcher
                     Scale = scale,
                     CropBottom = cropBottom,
                     DryRun = dryRun,
-                    Concurrency = concurrency
+                    Concurrency = concurrency,
+                    Optimized = optimized
                 };
             }
 

@@ -28,5 +28,8 @@ namespace ParcsNetMapsStitcher
 
         [Option("concurrency", Required = false, Default = 1, HelpText = "Concurrency level per worker.")]
         public int Concurrency { get; set; }
+
+        [Option("optimized", Required = false, Default = false, HelpText = "Use parallel downloads with thread pool optimization. Without this flag, downloads are sequential (for baseline).")]
+        public bool Optimized { get; set; }
     }
 }

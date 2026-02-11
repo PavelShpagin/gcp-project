@@ -10,13 +10,14 @@ param(
   [int]$PointsPerRegion = 1,
   [switch]$ForceRebuild,
   [int]$Concurrency = 16,
-  [int]$MaxRegions = 0
+  [int]$MaxRegions = 0,
+  [switch]$Optimized
 )
 
 $ErrorActionPreference = "Continue"
 
-# Discover running multi-region clusters
-$instances = & gcloud.cmd compute instances list --project $ProjectId --filter="name~'parcsnet-mr.*-host'" --format="csv[no-heading](name,zone,networkInterfaces[0].accessConfigs[0].natIP)"
+# Discover running multi-region clusters (external + internal IP in one call)
+$instances = & gcloud.cmd compute instances list --project $ProjectId --filter="name~'parcsnet-mr.*-host'" --format="csv[no-heading](name,zone,networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP)"
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($instances)) {
   throw "No multi-region host instances found."
 }
@@ -27,10 +28,12 @@ foreach ($line in ($instances -split "`n")) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
   $parts = $line -split ","
   if ($parts.Count -ge 3) {
+    $internalIp = if ($parts.Count -ge 4 -and $parts[3] -match "^\d+\.\d+\.\d+\.\d+$") { $parts[3] } else { $null }
     $hosts += [pscustomobject]@{
       name = $parts[0]
       zone = $parts[1]
       ip   = $parts[2]
+      internalIp = $internalIp
     }
   }
 }
@@ -139,28 +142,36 @@ if ($imageExists -and -not $ForceRebuild) {
 
 Write-Host ""
 Write-Host "Starting PARALLEL federated downloads..."
+Write-Host "Execution settings: pointsPerRegion=$PointsPerRegion, concurrency=$Concurrency, optimized=$($Optimized.IsPresent)"
 
 $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
 
-# Launch jobs
+# Pre-fetch any missing internal IPs (batch; avoids sequential calls in loop)
+foreach ($h in $hosts) {
+  if (-not $h.internalIp) {
+    $out = & gcloud.cmd compute instances describe $h.name --project $ProjectId --zone $h.zone --format="get(networkInterfaces[0].networkIP)" 2>&1
+    $h.internalIp = ($out | Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+$" } | Select-Object -First 1)
+  }
+}
+
+# Launch jobs (all internal IPs ready; no sequential gcloud in loop)
 $jobs = @()
 foreach ($a in $assignments) {
   $h = $a.host
   $region = ($h.name -replace "parcsnet-mr-", "" -replace "-host", "")
   $logFile = [System.IO.Path]::GetFullPath((Join-Path $outDir "log_${region}.txt"))
+  $hostInternalIp = $h.internalIp
+
+  Write-Host "Launching $region (tiles $($a.start)-$($a.end), host IP: $hostInternalIp, optimized=$($Optimized.IsPresent))..."
   
-  # Get host internal IP
-  $intIpCmd = "gcloud.cmd compute instances describe $($h.name) --project $ProjectId --zone $($h.zone) --format=`"get(networkInterfaces[0].networkIP)`""
-  $hostInternalIp = (cmd /c $intIpCmd 2>&1 | Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+$" } | Select-Object -First 1)
+  $optArg = if ($Optimized) { "--optimized" } else { "" }
   
-  Write-Host "Launching $region (tiles $($a.start)-$($a.end), host IP: $hostInternalIp)..."
-  
-  $job = Start-Job -Name $region -ArgumentList $h.ip, $sshKey, $PointsPerRegion, $Concurrency, $logFile, $hostInternalIp, $inputName, $a.start, $a.end -ScriptBlock {
-    param($ip, $key, $points, $concurrency, $logPath, $hostIntIp, $inputFileName, $tileStart, $tileEnd)
+  $job = Start-Job -Name $region -ArgumentList $h.ip, $sshKey, $PointsPerRegion, $Concurrency, $logFile, $hostInternalIp, $inputName, $a.start, $a.end, $optArg -ScriptBlock {
+    param($ip, $key, $points, $concurrency, $logPath, $hostIntIp, $inputFileName, $tileStart, $tileEnd, $optFlag)
     
     $sshOpts = "-i `"$key`" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=120 -o ServerAliveInterval=30 -o LogLevel=ERROR"
     
-    $dockerCmd = "docker run --rm --network host -e PARCS_POINT_START_DELAY_MS=0 -v /home/Pavel/parcsnet_run/out:/out parcsnet-maps-runner:latest --serverip $hostIntIp --user parcs-user --input /app/tests/$inputFileName --output /out/tiles.txt --points $points --downloadonly --tilestart $tileStart --tileend $tileEnd --concurrency $concurrency"
+    $dockerCmd = "docker run --rm --network host -e PARCS_POINT_START_DELAY_MS=0 -v /home/Pavel/parcsnet_run/out:/out parcsnet-maps-runner:latest --serverip $hostIntIp --user parcs-user --input /app/tests/$inputFileName --output /out/tiles.txt --points $points --downloadonly --tilestart $tileStart --tileend $tileEnd --concurrency $concurrency $optFlag"
     $sshFullCmd = "ssh.exe $sshOpts Pavel@$ip `"$dockerCmd`""
     
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -225,9 +236,9 @@ foreach ($r in $results) {
 }
 
 Write-Host ""
-# Baseline: 1 point downloading all 144 tiles = ~65s
+# Baseline: 1 point downloading all 144 tiles (~60s, no cache)
 # With federation: max region time (since parallel) = effective download time
-$baseline = 65.0
+$baseline = 60.0
 $speedup = $baseline / $maxDownload
 
 Write-Host "Speedup vs 1-point baseline (~${baseline}s for $totalTiles tiles):"
@@ -250,5 +261,5 @@ Points per region: $PointsPerRegion
 Wall-clock time: $($swTotal.Elapsed.TotalSeconds)s
 Max region download: ${maxDownload}s
 
-Speedup vs 1-point baseline: ${speedup}x
+Speedup vs 1-point baseline (~60s): ${speedup}x
 "@ | Out-File -FilePath (Join-Path $outDir "summary.txt") -Encoding UTF8
